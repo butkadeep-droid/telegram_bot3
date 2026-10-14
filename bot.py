@@ -7,7 +7,7 @@ import time
 from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
-​
+
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.enums import ChatAction, ChatType
 from aiogram.filters import Command, CommandStart
@@ -15,9 +15,9 @@ from aiogram.fsm.storage.memory import SimpleEventIsolation
 from aiogram.types import Message
 from dotenv import load_dotenv
 from openai import AsyncOpenAI, APIError
-​
+
 load_dotenv()
-​
+
 # ===== КЛЮЧИ: ЗАДАЙ ИХ В НАСТРОЙКАХ ХОСТИНГА =====
 # Раздел обычно называется Variables / Environment / Secrets / Config Vars.
 # TELEGRAM_BOT_TOKEN — сюда на хостинге впиши токен от BotFather.
@@ -29,7 +29,7 @@ load_dotenv()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
 # ================================================
-​
+
 # Для сохранения истории при перезапусках DB_PATH должен указывать
 # на файл в подключённом постоянном диске хостинга.
 DB = Path(os.getenv("DB_PATH", "data/gosha.sqlite3"))
@@ -42,7 +42,7 @@ if min(DAILY_LIMIT, MAX_CONCURRENT) < 1 or COOLDOWN < 0:
 HISTORY_MESSAGES = 24
 INPUT_CHARS = 2000
 OUTPUT_CHARS = 3500
-​
+
 SYSTEM = """Ты — ИИ-персонаж Гоша, дерзкий друг, а не реальный человек.
 Отвечай на языке собеседника; по умолчанию по-русски, на «ты».
 Стиль: коротко, обычно 2–4 предложения, сарказм, подколы, чёрный юмор.
@@ -68,8 +68,8 @@ MODES = {
     "hard": "Жёстко: острые подколы и умеренный мат, без унижения.",
     "raw": "Без фильтров: самый дерзкий юмор, мат уместен, но все границы действуют.",
 }
-​
-​
+
+
 def db_init():
     DB.parent.mkdir(parents=True, exist_ok=True)
     with closing(sqlite3.connect(DB, timeout=10)) as con, con:
@@ -89,8 +89,8 @@ def db_init():
             last_request REAL NOT NULL, PRIMARY KEY(user_id, day)
         );
         """)
-​
-​
+
+
 def db_run(action, uid=0, value=None):
     """Short transactions; executed off the event loop, never across API waits."""
     day = datetime.now(timezone.utc).date().isoformat()
@@ -136,17 +136,17 @@ def db_run(action, uid=0, value=None):
             con.execute("DELETE FROM messages WHERE user_id=? AND id NOT IN "
                         "(SELECT id FROM messages WHERE user_id=? ORDER BY id DESC LIMIT ?)",
                         (uid, uid, HISTORY_MESSAGES))
-​
-​
+
+
 async def store(action, uid=0, value=None):
     return await asyncio.to_thread(db_run, action, uid, value)
-​
-​
+
+
 router = Router()
 router.message.filter(F.chat.type == ChatType.PRIVATE)
 client = None
 in_flight = 0
-​
+
 NOTICE = """Я Гоша — ИИ-персонаж с дерзким юмором. 16+, возможен мат.
 /agree — подтверждаю, что мне 16+, и соглашаюсь на обработку сообщений.
 Текст и до 24 последних сообщений отправляются OpenRouter и провайдеру модели.
@@ -165,33 +165,33 @@ HELP = """/soft — Мягко
 /privacy — обработка данных
 Лимит: {limit} попыток генерации в день UTC, включая ошибки API.
 Только личные чаты и текст до {chars} символов. Подписка пока не подключена."""
-​
-​
+
+
 async def consent(message):
     row = await store("get", message.from_user.id)
     if not row or not row[0]:
         await message.answer("Сначала прочитай /start и подтверди возраст командой /agree.")
         return None
     return row
-​
-​
+
+
 @router.message(CommandStart())
 @router.message(Command("privacy"))
 async def start(message: Message):
     await message.answer(NOTICE)
-​
-​
+
+
 @router.message(Command("agree"))
 async def agree(message: Message):
     await store("agree", message.from_user.id)
     await message.answer("Принято. Гоша на связи. Что сегодня разбираем? /mode — выбрать стиль.")
-​
-​
+
+
 @router.message(Command("help", "mode"))
 async def help_handler(message: Message):
     await message.answer(HELP.format(limit=DAILY_LIMIT, chars=INPUT_CHARS))
-​
-​
+
+
 @router.message(Command("soft", "hard", "raw"))
 async def mode_handler(message: Message):
     if not await consent(message):
@@ -199,8 +199,8 @@ async def mode_handler(message: Message):
     mode = message.text.split()[0].split("@")[0][1:]
     await store("mode", message.from_user.id, mode)
     await message.answer("Режим: " + MODES[mode])
-​
-​
+
+
 @router.message(Command("reset", "delete"))
 async def clear_handler(message: Message):
     action = message.text.split()[0].split("@")[0][1:]
@@ -209,13 +209,13 @@ async def clear_handler(message: Message):
     if action == "delete":
         text += " Настройки и согласие тоже. Дневной счётчик удалится при следующей очистке после 00:00 UTC."
     await message.answer(text)
-​
-​
+
+
 @router.message(F.text.startswith("/"))
 async def unknown(message: Message):
     await message.answer("Не знаю эту команду. Загляни в /help.")
-​
-​
+
+
 @router.message(F.text)
 async def chat(message: Message):
     global in_flight
@@ -259,25 +259,25 @@ async def chat(message: Message):
         await store("save", uid, (message.text, answer))
     finally:
         in_flight -= 1
-​
-​
+
+
 @router.message()
 async def unsupported(message: Message):
     await message.answer("Пока умею только текст. Фото и голос — позже.")
-​
-​
+
+
 async def errors(event):
     # Never print inbound updates or exception text (Telegram URLs can contain tokens).
     logging.error("Handler failure: %s", type(event.exception).__name__)
     return True
-​
-​
+
+
 async def housekeeping():
     while True:
         await store("cleanup")
         await asyncio.sleep(3600)
-​
-​
+
+
 async def main():
     global client
     token = TELEGRAM_BOT_TOKEN
@@ -305,9 +305,8 @@ async def main():
         await asyncio.gather(task, return_exceptions=True)
         await client.close()
         await bot.session.close()
-​
-​
+
+
 if __name__ == "__main__":
     logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(message)s")
     asyncio.run(main())
-​
