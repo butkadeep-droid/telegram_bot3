@@ -26,8 +26,8 @@ load_dotenv()
 # Для локального запуска можно создать НЕ публикуемый файл .env:
 # TELEGRAM_BOT_TOKEN=твой_токен_от_BotFather
 # OPENROUTER_API_KEY=твой_ключ_OpenRouter
-TELEGRAM_BOT_TOKEN = os.getenv("8716590940:AAHOlX90mydB_DvRcZqLenCBNtIde7oL1Kk", "").strip()
-OPENROUTER_API_KEY = os.getenv("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", "").strip()
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
 # ================================================
 ​
 # Для сохранения истории при перезапусках DB_PATH должен указывать
