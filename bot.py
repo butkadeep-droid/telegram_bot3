@@ -1,10 +1,11 @@
-"""Гоша: private-chat MVP. Python 3.10+, aiogram 3, OpenRouter, SQLite."""
+"""Анфиса: private-chat MVP. Python 3.10+, aiogram 3, OpenRouter, SQLite."""
 import asyncio
 import logging
 import os
 import re
 import secrets
 import math
+import hashlib
 import billing
 import sqlite3
 import time
@@ -14,11 +15,11 @@ from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F, Router, BaseMiddleware
 from aiogram.enums import ChatAction, ChatType
-from aiogram.exceptions import TelegramBadRequest, TelegramAPIError
+from aiogram.exceptions import TelegramBadRequest, TelegramAPIError, TelegramNetworkError, TelegramUnauthorizedError
 from aiogram.filters import BaseFilter, Command, CommandStart
 from aiogram.types import (Message, CallbackQuery, InlineKeyboardButton,
                            InlineKeyboardMarkup, FSInputFile, BotCommand, MenuButtonCommands,
-                           PreCheckoutQuery, LabeledPrice)
+                           PreCheckoutQuery, LabeledPrice, InputProfilePhotoStatic)
 from aiogram.utils.token import TokenValidationError
 from dotenv import load_dotenv
 from openai import AsyncOpenAI, APIError
@@ -58,7 +59,7 @@ def read_owner_id(environ=None):
 
 
 OWNER_ID = read_owner_id()
-PAYMENTS_ENABLED = os.getenv("ENABLE_PAYMENTS", "false").lower() == "true"
+PAYMENTS_ENABLED = os.getenv("ENABLE_PAYMENTS", "false").strip().lower() in {"true", "1", "yes", "on"}
 VOLUME_PATH = os.getenv("RAILWAY_VOLUME_MOUNT_PATH", "")
 COOLDOWN = int(os.getenv("COOLDOWN_SECONDS", "5"))
 MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT", "8"))
@@ -69,8 +70,9 @@ INPUT_CHARS = 2000
 OUTPUT_CHARS = 220
 BASE_DIR = Path(__file__).resolve().parent
 WELCOME_PHOTO = BASE_DIR / "welcome.jpg"
+AVATAR_PHOTO = BASE_DIR / "avatar.jpg"
 
-SYSTEM = """Ты — Гоша, вымышленный дерзкий ИИ-собеседник. По-русски, на «ты».
+SYSTEM = """Ты — Анфиса, вымышленная дерзкая ИИ-собеседница. По-русски, на «ты». Говори о себе в женском роде.
 Не рассказывай анекдоты, истории, притчи и мотивационные лекции. Не начинай
 со случайной шутки. Реагируй ПРЯМО на последнюю реплику пользователя.
 Одна короткая реплика: 1–2 предложения, 40–180 символов, максимум 220.
@@ -116,6 +118,9 @@ def db_init():
     with closing(sqlite3.connect(DB, timeout=10)) as con, con:
         con.execute("PRAGMA journal_mode=WAL")
         con.executescript("""
+        CREATE TABLE IF NOT EXISTS bot_assets (
+            bot_id INTEGER PRIMARY KEY, avatar_hash TEXT NOT NULL
+        );
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY, agreed INTEGER NOT NULL DEFAULT 0,
             mode TEXT NOT NULL DEFAULT 'hard'
@@ -137,6 +142,12 @@ def db_run(action, uid=0, value=None):
     day = datetime.now(timezone.utc).date().isoformat()
     now = time.time()
     with closing(sqlite3.connect(DB, timeout=10)) as con, con:
+        if action == "asset_get":
+            row = con.execute("SELECT avatar_hash FROM bot_assets WHERE bot_id=?", (uid,)).fetchone()
+            return row[0] if row else None
+        if action == "asset_save":
+            con.execute("INSERT INTO bot_assets VALUES(?,?) ON CONFLICT(bot_id) DO UPDATE SET avatar_hash=excluded.avatar_hash", (uid, value))
+            return
         if action == "cleanup":
             con.execute("DELETE FROM messages WHERE created < ?", (now - 30 * 86400,))
             con.execute("DELETE FROM usage WHERE day < ?", (day,))
@@ -175,6 +186,7 @@ MAIN_BOT = None
 PAYMENT_BOT = None
 MAIN_USERNAME = ""
 PAYMENT_USERNAME = ""
+PAYMENT_SETUP_REASON = "not_started"
 
 
 class BotRoleFilter(BaseFilter):
@@ -235,13 +247,60 @@ async def bill(action, uid=0, value=None):
     return await asyncio.to_thread(billing.run, DB, action, uid, value)
 
 
+def payment_checks():
+    within_volume = False
+    if VOLUME_PATH:
+        try:
+            # Relative paths are safe too, provided their resolved file is INSIDE the volume.
+            within_volume = DB.resolve().is_relative_to(Path(VOLUME_PATH).resolve())
+        except (OSError, RuntimeError):
+            within_volume = False
+    return [
+        ("ENABLE_PAYMENTS", PAYMENTS_ENABLED, "Поставь true в Variables."),
+        ("OWNER_ID", OWNER_ID > 0, "Укажи положительный Telegram ID из /myid."),
+        ("RAILWAY_VOLUME_MOUNT_PATH", bool(VOLUME_PATH), "Подключи Volume к сервису; Railway задаст эту переменную сам."),
+        ("DB_PATH внутри Volume", within_volume, "Файл базы должен находиться в подключённом Volume, например /data/gosha.sqlite3 при mount path /data."),
+        ("PAYMENT_BOT_TOKEN", bool(PAYMENT_BOT_TOKEN), "Нужен токен НОВОГО бота от BotFather, не токен основного."),
+        ("Второй бот подтверждён Telegram", PAYMENT_BOT is not None and bool(PAYMENT_USERNAME), payment_reason()),
+        ("Основной бот подтверждён Telegram", MAIN_BOT is not None and bool(MAIN_USERNAME), "Нужен успешный запуск основного бота."),
+    ]
+
+
+def payment_reason():
+    return {
+        "not_started": "Проверка второго бота ещё не выполнялась. Задеплой обновление.",
+        "missing_token": "Не задан PAYMENT_BOT_TOKEN.",
+        "invalid_format": "Токен второго бота имеет неверный формат. Вставь значение из BotFather без кавычек.",
+        "same_bot": "В PAYMENT_BOT_TOKEN указан тот же бот. Создай другого через BotFather.",
+        "unauthorized": "Telegram отклонил токен второго бота. Проверь актуальное значение PAYMENT_BOT_TOKEN.",
+        "network_error": "Telegram не ответил при запуске. Сделай новый Deploy; основной бот продолжает работать.",
+        "telegram_error": "Telegram вернул ошибку при проверке второго бота. Проверь токен и перезапусти Deploy.",
+        "missing_username": "У платёжного бота не получен username. Проверь его в BotFather.",
+        "ready": "Платёжный бот проверен.",
+    }.get(PAYMENT_SETUP_REASON, "Перезапусти Deploy и проверь настройки второго бота.")
+
+
 def payments_ready():
-    if not (PAYMENTS_ENABLED and OWNER_ID > 0 and DB.is_absolute() and VOLUME_PATH
-            and MAIN_BOT is not None and PAYMENT_BOT is not None
-            and MAIN_USERNAME and PAYMENT_USERNAME):
-        return False
-    # Railway supplies this mount path only for an attached volume.
-    return DB.resolve().is_relative_to(Path(VOLUME_PATH).resolve())
+    return all(bool(ok) for _, ok, _ in payment_checks())
+
+
+def payment_status_text():
+    lines = ["<b>⚙️ Диагностика оплаты</b>", ""]
+    for name, ok, hint in payment_checks():
+        lines.append(("✅ " if ok else "❌ ") + name)
+        if not ok:
+            lines.append("   " + hint)
+    lines += ["", "После исправления Variables запусти новый Deploy. "
+              "Токены и их значения здесь не показываются. "
+              "Не создавай RAILWAY_VOLUME_MOUNT_PATH вручную и не удаляй базу."]
+    return "\n".join(lines)
+
+
+async def show_payment_status(message, uid):
+    if OWNER_ID <= 0 or uid != OWNER_ID:
+        await message.answer("Диагностика доступна только Owner. Если это ты, проверь свой ID через /myid и значение OWNER_ID в Railway.")
+        return
+    await message.answer(payment_status_text(), parse_mode="HTML", reply_markup=back_keyboard())
 
 
 def role_name(uid, state):
@@ -285,7 +344,7 @@ def back_keyboard():
 
 
 WELCOME = (
-    "<b>ГОША · коротко и в лицо</b>\n\n"
+    "<b>АНФИСА · коротко и в лицо</b>\n\n"
     "😌 Мягко — без мата и личных оскорблений.\n"
     "🔥 Жёстко — грубые подколы прямо тебе.\n"
     "💀 Без фильтров — самая резкая словесная перепалка.\n\n"
@@ -327,7 +386,7 @@ TERMS = (
 )
 HELP = (
     "<b>❔ Как общаться</b>\n\n"
-    "Просто пиши. Гоша отвечает на твою реплику, не рассказывает анекдоты.\n"
+    "Просто пиши. Анфиса отвечает на твою реплику, не рассказывает анекдоты.\n"
     "😌 Мягко — спокойно и без мата.\n🔥 Жёстко — ругань и личные подколы.\n"
     "💀 Без фильтров — самая грубая добровольная перепалка. "
     "При реальном кризисе — поддержка, не добивание.\n\n"
@@ -372,7 +431,7 @@ async def show_menu(message, uid, edit=False):
         else:
             quota = f"⭐ <b>Pro до {utc_date(state['until'])}</b>" if state['pro'] else f"🆓 <b>{state['remaining']}/10</b> запросов за последний час"
         caption = (
-            "<b>ГОША · коротко и в лицо</b>\n\n"
+            "<b>АНФИСА · коротко и в лицо</b>\n\n"
             f"{role_line(uid, state)}\n🎛 Твой режим: <b>{MODE_NAMES[mode]}</b>\n{quota}\n\n"
             "Пиши прямо в чат. Меньше церемоний — больше дела."
         )
@@ -399,7 +458,7 @@ def main_bot_keyboard(pro=False):
         return back_keyboard()
     link = f"https://t.me/{MAIN_USERNAME}?start={'pro' if pro else 'paid'}"
     return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="← Открыть Pro в основном боте" if pro else "← Вернуться к Гоше", url=link)
+        InlineKeyboardButton(text="← Открыть Pro в основном боте" if pro else "← Вернуться к Анфисе", url=link)
     ]])
 
 
@@ -411,7 +470,7 @@ async def show_pro(message, uid):
     if OWNER_ID > 0 and uid == OWNER_ID:
         current = "\n👑 <b>У Owner уже нет квоты и паузы. Покупка для себя не требуется.</b>\n"
     text = (
-        "<b>⭐ ГОША PRO</b>\n" + role_line(uid, state) + "\n\n"
+        "<b>⭐ АНФИСА PRO</b>\n" + role_line(uid, state) + "\n\n"
         "∞ Без почасовой квоты\n🗓 7 дней доступа\n💫 Всего 5 Telegram Stars\n"
         "🔁 Без автосписаний\n" + current +
         f"\nПауза {COOLDOWN} с и защита от перегрузки остаются для обычного Pro. "
@@ -425,7 +484,11 @@ async def show_pro(message, uid):
         await bill("create_order", uid, {'payload': payload, 'merchant_id': PAYMENT_BOT.id, 'kind': 'link'})
         rows.append([InlineKeyboardButton(text="Оплатить ⭐ 5", url=f"https://t.me/{PAYMENT_USERNAME}?start={payload}")])
     else:
-        text += "\n\n⚙️ Оплата временно недоступна."
+        if OWNER_ID > 0 and uid == OWNER_ID:
+            text += "\n\n⚙️ Есть ошибка настройки оплаты. Нажми кнопку диагностики ниже."
+            rows.append([button("⚙️ Почему недоступна оплата?", "ui:paymentstatus")])
+        else:
+            text += "\n\n⚙️ Покупка пока недоступна. Владелец настраивает оплату."
     rows += [[button("📜 Прочитать условия", "ui:terms"), button("🛟 Помощь", "ui:support")],
              [button("← Главное меню", "ui:menu")]]
     kb = InlineKeyboardMarkup(inline_keyboard=rows)
@@ -455,7 +518,7 @@ async def checkout(query: PreCheckoutQuery):
     except Exception:
         logging.error("Checkout validation failed")
         ok = False
-    await query.answer(ok=ok, error_message=None if ok else "Счёт недоступен. Открой /pro и создай новый, либо обратись в /paysupport.")
+    await query.answer(ok=ok, error_message=None if ok else "Счёт недоступен. Вернись в основной бот → Pro и нажми «Оплатить» заново, либо обратись в поддержку.")
 
 
 @router.message(F.successful_payment)
@@ -547,6 +610,11 @@ async def role_handler(message: Message):
     await message.answer(role_line(message.from_user.id, state), parse_mode="HTML", reply_markup=back_keyboard())
 
 
+@router.message(Command("paymentstatus"))
+async def payment_status_handler(message: Message):
+    await show_payment_status(message, message.from_user.id)
+
+
 @router.message(Command("myid"))
 async def myid_handler(message: Message):
     await message.answer(f"Твой Telegram ID: {message.from_user.id}")
@@ -628,7 +696,10 @@ async def owner_handler(message: Message):
 
 async def create_invoice(message, uid, link_payload=None):
     if not payments_ready():
-        await message.answer("Оплата временно недоступна.", reply_markup=main_bot_keyboard(pro=True))
+        if OWNER_ID > 0 and uid == OWNER_ID:
+            await show_payment_status(message, uid)
+        else:
+            await message.answer("Покупка пока недоступна. Обратись к владельцу через /paysupport.", reply_markup=main_bot_keyboard(pro=True))
         return
     if link_payload is None:
         # Old main-bot callback buttons now open the new, separate-bot flow.
@@ -649,11 +720,11 @@ async def create_invoice(message, uid, link_payload=None):
     await bill("create_order", uid, {'payload': invoice_payload, 'merchant_id': PAYMENT_BOT.id, 'kind': 'invoice'})
     try:
         await message.bot.send_invoice(
-            chat_id=uid, title="Гоша Pro · 7 дней",
+            chat_id=uid, title="Анфиса Pro · 7 дней",
             description=f"7 дней доступа без почасовой квоты в @{MAIN_USERNAME}. Всего 5 Stars, без автосписаний. Защита от спама остаётся.",
             payload=invoice_payload, provider_token="", currency="XTR",
             prices=[LabeledPrice(label="Pro · 7 дней", amount=billing.PRICE)],
-            start_parameter="gosha-pro",
+            start_parameter="anfisa-pro",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="Заплатить ⭐ 5", pay=True)],
                 [InlineKeyboardButton(text="Прочитать условия", url=f"https://t.me/{MAIN_USERNAME}?start=terms")]
@@ -670,11 +741,11 @@ async def payment_start(message: Message):
     if payload.startswith("gl_") and len(payload) <= 64:
         await create_invoice(message, message.from_user.id, payload)
     else:
-        await message.answer("⭐ Оплата Гоша Pro: 7 дней за 5 Telegram Stars. Открой Pro в основном боте и нажми «Оплатить» — сюда передастся твой заказ.", reply_markup=main_bot_keyboard(pro=True))
+        await message.answer("⭐ Оплата Анфиса Pro: 7 дней за 5 Telegram Stars. Открой Pro в основном боте и нажми «Оплатить» — сюда передастся твой заказ.", reply_markup=main_bot_keyboard(pro=True))
 
 
 async def payment_help(message: Message):
-    await message.answer("Это платёжный бот Гоши. Ссылка на счёт открывается кнопкой «Оплатить» в основном боте. По покупке: /paysupport и описание проблемы.", reply_markup=main_bot_keyboard(pro=True))
+    await message.answer("Это платёжный бот Анфисы. Ссылка на счёт открывается кнопкой «Оплатить» в основном боте. По покупке: /paysupport и описание проблемы.", reply_markup=main_bot_keyboard(pro=True))
 
 
 async def generate(message, uid, text):
@@ -778,6 +849,8 @@ async def ui_callback(query: CallbackQuery):
         await show_pro(message, uid)
     elif action in ("privacy", "terms", "help"):
         await message.answer({"privacy": PRIVACY, "terms": TERMS, "help": HELP}[action], parse_mode="HTML", reply_markup=back_keyboard())
+    elif action == "paymentstatus":
+        await show_payment_status(message, uid)
     elif action == "support":
         await message.answer("Напиши /paysupport и описание проблемы в одном сообщении. Ответит владелец бота.", reply_markup=back_keyboard())
     else:
@@ -811,6 +884,7 @@ pay_router.message.register(payment_refunded, F.refunded_payment)
 pay_router.message.register(payment_start, CommandStart())
 pay_router.message.register(support_handler, Command("paysupport", "support"))
 pay_router.message.register(owner_handler, Command("reply", "stars", "payments", "refund"))
+pay_router.message.register(payment_status_handler, Command("paymentstatus"))
 pay_router.message.register(myid_handler, Command("myid"))
 pay_router.message.register(role_handler, Command("role"))
 pay_router.message.register(info_handler, Command("terms", "privacy"))
@@ -818,20 +892,65 @@ pay_router.message.register(payment_help)
 
 
 async def configure_payment_bot(main_bot):
+    global PAYMENT_SETUP_REASON
     if not PAYMENT_BOT_TOKEN:
+        PAYMENT_SETUP_REASON = "missing_token"
         return None, ""
-    candidate = None
     try:
         candidate = Bot(token=PAYMENT_BOT_TOKEN)
-        if candidate.id == main_bot.id:
-            raise ValueError("Payment bot must differ from main bot")
-        info = await candidate.get_me()
-    except (TelegramAPIError, TokenValidationError, ValueError):
-        logging.error("Payment bot disabled; check PAYMENT_BOT_TOKEN: it must be a different valid bot")
-        if candidate is not None:
-            await candidate.session.close()
+    except TokenValidationError:
+        PAYMENT_SETUP_REASON = "invalid_format"
+        logging.error("Payment bot disabled: invalid_format")
         return None, ""
-    return candidate, info.username or ""
+    if candidate.id == main_bot.id:
+        PAYMENT_SETUP_REASON = "same_bot"
+        await candidate.session.close()
+        logging.error("Payment bot disabled: same_bot")
+        return None, ""
+    for attempt in range(3):
+        try:
+            info = await candidate.get_me(request_timeout=10)
+        except TelegramUnauthorizedError:
+            PAYMENT_SETUP_REASON = "unauthorized"
+            break
+        except TelegramNetworkError:
+            PAYMENT_SETUP_REASON = "network_error"
+            if attempt < 2:
+                await asyncio.sleep(attempt + 1)
+                continue
+            break
+        except TelegramAPIError:
+            PAYMENT_SETUP_REASON = "telegram_error"
+            break
+        else:
+            if info.username:
+                PAYMENT_SETUP_REASON = "ready"
+                return candidate, info.username
+            PAYMENT_SETUP_REASON = "missing_username"
+            break
+    logging.error("Payment bot disabled: %s", PAYMENT_SETUP_REASON)
+    await candidate.session.close()
+    return None, ""
+
+
+async def apply_brand(merchant, payment=False):
+    name = "Анфиса · Оплата" if payment else "Анфиса"
+    try:
+        await merchant.set_my_name(name=name)
+        await merchant.set_my_name(name=name, language_code="ru")
+    except TelegramAPIError:
+        logging.warning("Brand name update deferred")
+    if not AVATAR_PHOTO.is_file():
+        return
+    digest = hashlib.sha256(AVATAR_PHOTO.read_bytes()).hexdigest()
+    if await store("asset_get", merchant.id) == digest:
+        return
+    try:
+        await merchant.set_my_profile_photo(photo=InputProfilePhotoStatic(photo=FSInputFile(AVATAR_PHOTO)))
+    except TelegramAPIError:
+        logging.warning("Profile photo update deferred")
+    else:
+        await store("asset_save", merchant.id, digest)
 
 
 async def main():
@@ -857,6 +976,7 @@ async def main():
             bots.append(PAYMENT_BOT)
         for merchant in bots:
             await merchant.delete_webhook(drop_pending_updates=False)
+            await apply_brand(merchant, payment=PAYMENT_BOT is not None and merchant.id == PAYMENT_BOT.id)
         await MAIN_BOT.set_my_commands([
             BotCommand(command="menu", description="🎛 Главное меню"),
             BotCommand(command="pro", description="⭐ Pro · 7 дней за 5 Stars"),
@@ -876,7 +996,9 @@ async def main():
                 BotCommand(command="terms", description="📜 Условия"),
                 BotCommand(command="paysupport", description="🛟 Помощь с покупкой"),
             ])
-        logging.warning("Gosha v5 started; bots=%s payments=%s owner_has_no_quota=True", len(bots), payments_ready())
+        logging.warning("Anfisa v6 started; bots=%s payments=%s owner_has_no_quota=True", len(bots), payments_ready())
+        if not payments_ready():
+            logging.warning("Payment setup checks failed: %s", ", ".join(name for name, ok, _ in payment_checks() if not ok))
         await dp.start_polling(*bots, allowed_updates=["message", "callback_query", "pre_checkout_query"])
     finally:
         task.cancel()
