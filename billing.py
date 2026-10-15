@@ -1,4 +1,4 @@
-"""Local accounting for one-time Telegram Stars purchases of 7 days of Pro.
+"""Local accounting for one-time Telegram Stars purchases of 7 days of Plus.
 No Telegram calls here. All grants and quotas are transaction-safe.
 """
 import sqlite3
@@ -142,6 +142,9 @@ def run(path, action, uid=0, value=None, now=None):
             cooldown = float(value.get('cooldown', 0)) if isinstance(value, dict) else float(value or 0)
             exempt = bool(value.get('bypass_quota', False)) if isinstance(value, dict) else False
             state = snapshot(con, uid, now)
+            # Authorize smart generation inside the same transaction as its reservation.
+            if isinstance(value, dict) and value.get('require_pro') and not exempt and not state['pro']:
+                return {'ok': False, 'reason': 'pro_required'}
             rate = con.execute('SELECT last_ts FROM rate_limits WHERE user_id=?', (uid,)).fetchone()
             if rate and now - rate[0] < cooldown:
                 return {'ok': False, 'reason': 'cooldown'}
