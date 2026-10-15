@@ -5,7 +5,7 @@ import sqlite3
 import time
 from contextlib import closing
 
-PRICE = 1  # Temporary offer. New orders capture this price; old invoices keep theirs.
+PRICE = 5  # Regular price restored. Already confirmed orders keep their recorded price.
 DURATION = 7 * 24 * 60 * 60
 FREE_LIMIT = 20
 GOSHA_BONUS = 5

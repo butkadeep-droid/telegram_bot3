@@ -830,8 +830,7 @@ async def gosha_easter_egg(message: Message):
         if result['granted']:
             await message.answer(
                 f"🎁 Пасхалка найдена! +{billing.GOSHA_BONUS} запросов в час навсегда.\n"
-                f"Твой бесплатный лимит теперь — {result['limit']} запросов/час. "
-                "У Pro и Owner почасовой квоты по-прежнему нет.", parse_mode=None)
+                f"Твой бесплатный лимит теперь — {result['limit']} запросов/час.", parse_mode=None)
         else:
             await message.answer(
                 f"🎁 Бонус уже твой: бесплатный лимит — {result['limit']} запросов/час. "
@@ -985,10 +984,70 @@ async def apply_brand(merchant, payment=False):
         await store("asset_save", merchant.id, digest)
 
 
+def backup_before_price_restore():
+    """One verified full SQLite snapshot on the SAME volume, before init/cleanup.
+
+    Includes history, settings, purchases, bonus flags, quotas and every other table.
+    Uses SQLite backup (also covers committed WAL data), not a raw file copy.
+    An existing verified release snapshot is never overwritten on a restart.
+    """
+    if not DB.exists():
+        logging.warning("Database backup: no existing database at configured DB_PATH")
+        return None
+    source = DB.resolve()
+    if not VOLUME_PATH or not source.is_relative_to(Path(VOLUME_PATH).resolve()):
+        raise RuntimeError("Backup requires the existing DB_PATH to be inside its Railway Volume")
+    folder = source.parent / "backups"
+    if not folder.resolve().is_relative_to(Path(VOLUME_PATH).resolve()):
+        raise RuntimeError("Backup directory must stay inside Railway Volume")
+    folder.mkdir(parents=True, exist_ok=True, mode=0o700)
+    target = folder / (source.name + ".before-pro5-v9.sqlite3")
+
+    def verify(path):
+        if path.is_symlink():
+            raise RuntimeError("Backup must be a regular file")
+        with closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=30)) as con:
+            if con.execute("PRAGMA page_count").fetchone()[0] == 0 or con.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+                raise RuntimeError("Database backup integrity check failed")
+
+    if target.exists():
+        verify(target)
+        logging.warning("Database backup ready: %s", target.name)
+        return target
+    temporary = folder / (target.name + ".tmp-" + secrets.token_hex(8))
+    fd = os.open(temporary, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    os.close(fd)
+    deadline = time.monotonic() + 90
+
+    def progress(status, remaining, total):
+        if time.monotonic() > deadline:
+            raise TimeoutError("Database backup timed out")
+
+    try:
+        with closing(sqlite3.connect(source.as_uri() + "?mode=ro", uri=True, timeout=30)) as src:
+            with closing(sqlite3.connect(temporary, timeout=30)) as dst:
+                src.backup(dst, pages=256, progress=progress, sleep=0.05)
+        verify(temporary)
+        try:
+            # Atomic publication without overwriting an earlier successful snapshot.
+            os.link(temporary, target)
+        except FileExistsError:
+            verify(target)
+    finally:
+        temporary.unlink(missing_ok=True)
+    logging.warning("Database backup ready: %s", target.name)
+    return target
+
+
 async def main():
     global client, MAIN_BOT, PAYMENT_BOT, MAIN_USERNAME, PAYMENT_USERNAME
     if not TELEGRAM_BOT_TOKEN or not OPENROUTER_API_KEY:
         raise SystemExit("Задай TELEGRAM_BOT_TOKEN и OPENROUTER_API_KEY в Railway Variables")
+    try:
+        await asyncio.to_thread(backup_before_price_restore)
+    except Exception:
+        logging.error("Database backup failed; database was not changed")
+        raise SystemExit("Не удалось сохранить резервную копию. База не изменена. Проверь Volume, DB_PATH и свободное место; не удаляй базу.") from None
     await asyncio.to_thread(db_init)
     await asyncio.to_thread(billing.init, DB)
     await store("cleanup")
@@ -1028,7 +1087,7 @@ async def main():
                 BotCommand(command="terms", description="📜 Условия"),
                 BotCommand(command="paysupport", description="🛟 Помощь с покупкой"),
             ])
-        logging.warning("Anfisa v6 started; bots=%s payments=%s owner_has_no_quota=True", len(bots), payments_ready())
+        logging.warning("Anfisa v9 started; bots=%s payments=%s owner_has_no_quota=True", len(bots), payments_ready())
         if not payments_ready():
             logging.warning("Payment setup checks failed: %s", ", ".join(name for name, ok, _ in payment_checks() if not ok))
         await dp.start_polling(*bots, allowed_updates=["message", "callback_query", "pre_checkout_query"])
