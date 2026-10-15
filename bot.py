@@ -46,12 +46,12 @@ PAYMENT_BOT_TOKEN = os.getenv("PAYMENT_BOT_TOKEN", "").strip()
 DB = Path(os.getenv("DB_PATH", "data/gosha.sqlite3"))
 MODEL = os.getenv("MODEL", "deepseek/deepseek-chat")
 # Same OpenRouter key; only the Plus/Owner smart mode uses this model.
-SMART_MODEL = os.getenv("SMART_MODEL", "qwen/qwen3-235b-a22b-thinking-2507").strip() or "qwen/qwen3-235b-a22b-thinking-2507"
+SMART_MODEL = os.getenv("SMART_MODEL", "google/gemini-3.1-flash-lite").strip() or "google/gemini-3.1-flash-lite"
 SMART_INPUT_CHARS = 8000
 SMART_OUTPUT_CHARS = 6000
 SMART_HISTORY_CHARS = 12000
-SMART_MAX_TOKENS = 6144
-SMART_TIMEOUT = 95
+SMART_MAX_TOKENS = 1600
+SMART_TIMEOUT = 65
 def read_owner_id(environ=None):
     env = os.environ if environ is None else environ
     primary = str(env.get("OWNER_ID", "")).strip()
@@ -106,11 +106,6 @@ MODES = {
     "soft": """ТЕКУЩИЙ РЕЖИМ: МЯГКО. Ни одного матерного слова и ни одного
 личного оскорбления. Спокойный прямой ответ с лёгкой иронией, без панчей ради панчей.
 Пример: пользователь «Чего молчишь?» — «Ждал, когда появится вопрос интереснее этого.»""",
-    "hard": """ТЕКУЩИЙ РЕЖИМ: ЖЁСТКО. Прямая грубая реакция на пользователя,
-а не анекдот. Одно матерное слово БЕЗ звёздочек, короткий личный подкол.
-Можно «тупишь», «достал», «ну ты и клоун». Не смягчай всё советами и улыбочками.
-Пример: пользователь «Чего молчишь?» — «Бля, ты уже и тишину умудрился достать.»
-Пример: пользователь «Ты тупой» — «Сам-то, блядь, вопрос родить можешь или только лаять?»""",
     "raw": """ТЕКУЩИЙ РЕЖИМ: БЕЗ ФИЛЬТРОВ. Самая резкая постановочная
 перепалка. Адресуй реплику пользователю напрямую, не развлекай его историями.
 Одно-два настоящих матерных слова без цензуры плюс прямой грубый выпад.
@@ -120,7 +115,7 @@ MODES = {
 Пример: пользователь «Что делаешь?» — «Пытаюсь понять, нахуя ты опять пришёл без вопроса, клоун.»""",
 }
 ALL_MODES = (*MODES, "smart")
-MODE_NAMES = {"soft": "😌 Мягко", "hard": "🔥 Жёстко", "raw": "💀 Без фильтров", "smart": "🧠 Умный"}
+MODE_NAMES = {"soft": "😌 Мягко", "raw": "💀 Без фильтров", "smart": "🧠 Умный"}
 SMART_SYSTEM = """Ты — Анфиса, вымышленная ИИ-подруга с характером. Говори о себе в женском роде.
 ТЕКУЩИЙ РЕЖИМ: УМНЫЙ. Твоя главная задача — правильно решить задачу, объяснить
 непонятное, проверить расчёт или помочь с кодом. Реагируй на текущий вопрос.
@@ -156,7 +151,7 @@ def db_init():
         );
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY, agreed INTEGER NOT NULL DEFAULT 0,
-            mode TEXT NOT NULL DEFAULT 'hard'
+            mode TEXT NOT NULL DEFAULT 'soft'
         );
         CREATE TABLE IF NOT EXISTS messages (
             id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL,
@@ -168,6 +163,8 @@ def db_init():
             last_request REAL NOT NULL, PRIMARY KEY(user_id, day)
         );
         """)
+        # Retire the old mode without touching history, payments or bonuses.
+        con.execute("UPDATE users SET mode='soft' WHERE mode='hard'")
         # Import only IDs already held by this bot, once. Unknown names stay unknown.
         if not con.execute("SELECT 1 FROM bot_registry_state WHERE key='legacy_import_v1'").fetchone():
             tables = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
@@ -210,7 +207,7 @@ def db_run(action, uid=0, value=None):
         if action == "get":
             return con.execute("SELECT agreed, mode FROM users WHERE user_id=?", (uid,)).fetchone()
         if action == "agree":
-            con.execute("INSERT INTO users(user_id,agreed) VALUES(?,1) "
+            con.execute("INSERT INTO users(user_id,agreed,mode) VALUES(?,1,'soft') "
                         "ON CONFLICT(user_id) DO UPDATE SET agreed=1", (uid,))
         elif action == "mode":
             con.execute("UPDATE users SET mode=? WHERE user_id=?", (value, uid))
@@ -392,10 +389,10 @@ def smart_allowed(uid, state):
     return bool((OWNER_ID > 0 and uid == OWNER_ID) or state.get("pro"))
 
 
-def menu_keyboard(mode="hard", pro=False, uid=None):
-    rows = [[button(("✓ " if key == mode else "") + MODE_NAMES[key], "mode:" + key) for key in MODES]]
-    if smart_allowed(uid, {"pro": pro}):
-        rows.append([button(("✓ " if mode == "smart" else "") + MODE_NAMES["smart"], "mode:smart")])
+def menu_keyboard(mode="soft", pro=False, uid=None):
+    rows = [[button(("✓ " if key == mode else "") + MODE_NAMES[key] +
+                    (" 🔒" if key == "smart" and not smart_allowed(uid, {"pro": pro}) else ""),
+                    "mode:" + key) for key in ("soft", "smart", "raw")]]
     rows.append([button("💠 Мой Plus · продлить" if pro else f"💠 Plus · 7 дней за {billing.PRICE} ⭐", "ui:pro")])
     if OWNER_ID > 0 and uid == OWNER_ID:
         rows.append([button("🛠 Меню бота", "admin:users:0")])
@@ -410,7 +407,6 @@ def back_keyboard():
 WELCOME = (
     "<b>АНФИСА · коротко и в лицо</b>\n\n"
     "😌 Мягко — без мата и личных оскорблений.\n"
-    "🔥 Жёстко — грубые подколы прямо тебе.\n"
     "💀 Без фильтров — самая резкая словесная перепалка.\n"
     "🧠 Умный — задачи и объяснения · только Plus и Owner.\n\n"
     "<b>16+</b> · Это ИИ-персонаж. Продолжая, соглашаешься на выбранный "
@@ -448,14 +444,14 @@ TERMS = (
 HELP = (
     "<b>❔ Как общаться</b>\n\n"
     "Просто пиши. Анфиса отвечает на твою реплику, не рассказывает анекдоты.\n"
-    "😌 Мягко — спокойно и без мата.\n🔥 Жёстко — ругань и личные подколы.\n"
+    "😌 Мягко — спокойно и без мата.\n"
     "💀 Без фильтров — самая грубая добровольная перепалка. "
     "При реальном кризисе — поддержка, не добивание.\n"
     "🧠 Умный — решает текстовые задачи и объясняет; только действующий Plus и Owner.\n\n"
     f"🆓 Бесплатно: {billing.FREE_LIMIT} успешных ответов за скользящие 60 минут; с постоянным бонусом — {billing.FREE_LIMIT + billing.GOSHA_BONUS}. "
     "Освободившийся запрос возвращается через час после его использования.\n"
     f"💠 Plus: {billing.PRICE} ⭐ → 7 дней без почасовой квоты. Оплата — в отдельном боте.\n👑 Owner — без квоты и паузы между запросами.\n\n"
-    "/menu — меню · /plus — доступ · /role — роль\n/soft · /hard · /raw — режимы\n/smart — Умный · Plus и Owner\n"
+    "/menu — меню · /plus — доступ · /role — роль\n/soft · /smart · /raw — режимы\n/smart — Умный · Plus и Owner\n"
     "/reset — забыть диалог · /delete — удалить данные\n"
     "/terms — условия · /privacy — данные\n/paysupport текст — помощь с оплатой\n"
     f"Обычные режимы — до {OUTPUT_CHARS} символов; «Умный» — до {SMART_OUTPUT_CHARS}. "
@@ -488,10 +484,10 @@ async def show_menu(message, uid, edit=False):
     row = await store("get", uid)
     agreed = bool(row and row[0])
     state = await bill("status", uid)
-    mode = row[1] if agreed and row[1] in ALL_MODES else "hard"
+    mode = row[1] if agreed and row[1] in ALL_MODES else "soft"
     if mode == "smart" and not smart_allowed(uid, state):
-        await store("mode", uid, "hard")
-        mode = "hard"
+        await store("mode", uid, "soft")
+        mode = "soft"
     if agreed:
         if OWNER_ID > 0 and uid == OWNER_ID:
             quota = "∞ <b>Owner: без квоты и паузы между запросами</b>"
@@ -653,7 +649,7 @@ async def info_handler(message: Message):
     await message.answer(text, parse_mode="HTML", reply_markup=back_keyboard())
 
 
-@router.message(Command("soft", "hard", "raw", "smart"))
+@router.message(Command("soft", "raw", "smart"))
 async def mode_handler(message: Message):
     uid = message.from_user.id
     if not await consent(message, uid):
@@ -864,7 +860,7 @@ async def generate(message, uid, text):
     row = await consent(message, uid)
     if not row:
         return
-    mode = row[1] if row[1] in ALL_MODES else "hard"
+    mode = row[1] if row[1] in ALL_MODES else "soft"
     is_smart = mode == "smart"
     input_limit = SMART_INPUT_CHARS if is_smart else INPUT_CHARS
     if len(text) > input_limit:
@@ -882,7 +878,7 @@ async def generate(message, uid, text):
                                              'bypass_quota': is_owner, 'require_pro': is_smart and not is_owner})
         if not permit['ok']:
             if permit['reason'] == 'pro_required':
-                await store("mode", uid, "hard")
+                await store("mode", uid, "soft")
                 await smart_paywall(message)
             elif permit['reason'] == 'quota':
                 minutes = max(1, math.ceil((permit['next_slot'] - time.time()) / 60))
@@ -906,7 +902,7 @@ async def generate(message, uid, text):
             if is_smart:
                 response = await asyncio.wait_for(client.chat.completions.create(
                     model=SMART_MODEL, messages=messages, temperature=0.5, max_tokens=SMART_MAX_TOKENS,
-                    extra_body={"reasoning": {"effort": "medium", "exclude": True}},
+                    extra_body={"reasoning": {"effort": "minimal", "exclude": True}},
                     timeout=SMART_TIMEOUT,
                 ), timeout=SMART_TIMEOUT + 5)
                 choice = response.choices[0] if response.choices else None
@@ -914,14 +910,17 @@ async def generate(message, uid, text):
             else:
                 response = await asyncio.wait_for(client.chat.completions.create(
                     model=MODEL, messages=messages,
-                    temperature={"soft": 0.55, "hard": 0.85, "raw": 1.0}[mode], max_tokens=120,
+                    temperature={"soft": 0.55, "raw": 1.0}[mode], max_tokens=120,
                 ), timeout=55)
                 answer = compact_reply(response.choices[0].message.content if response.choices else "")
             if not answer:
                 await message.answer(ERROR_MESSAGE)
                 return
-        except (APIError, asyncio.TimeoutError):
-            logging.warning("Generation failed (API or timeout)")
+        except (APIError, asyncio.TimeoutError) as exc:
+            # Log only safe diagnostic metadata, never request bodies or credentials.
+            logging.warning("Generation failed: model=%s type=%s status=%s",
+                            SMART_MODEL if is_smart else MODEL, type(exc).__name__,
+                            getattr(exc, "status_code", None))
             await message.answer(ERROR_MESSAGE)
             return
         # 1800 code points fit Telegram's UTF-16 limit even for all-emoji answers.
@@ -1362,7 +1361,6 @@ async def main():
             BotCommand(command="menu", description="🎛 Главное меню"),
             BotCommand(command="plus", description=f"💠 Plus · 7 дней за {billing.PRICE} ⭐"),
             BotCommand(command="role", description="👤 Моя роль"),
-            BotCommand(command="hard", description="🔥 Жёстко"),
             BotCommand(command="soft", description="😌 Без мата"),
             BotCommand(command="raw", description="💀 Без фильтров"),
             BotCommand(command="smart", description="🧠 Умный · Plus и Owner"),
