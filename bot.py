@@ -924,7 +924,7 @@ async def show_bot_admin(message, uid, page=0, edit=False):
     rows = []
     for recipient_id, username in roster['rows']:
         label = ("@" + username) if username else "Без юзернейма"
-        rows.append([button(f"👤 {label} · {recipient_id}", f"admin:users:{page}"),
+        rows.append([InlineKeyboardButton(text=f"👤 {label} · {recipient_id}", url=f"tg://user?id={recipient_id}"),
                      button("🎁 Pro на 1 день", f"admin:giftstart:{recipient_id}:{page}")])
     nav = []
     if page > 0:
