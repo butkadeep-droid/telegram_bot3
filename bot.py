@@ -40,7 +40,21 @@ OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
 # на файл в подключённом постоянном диске хостинга.
 DB = Path(os.getenv("DB_PATH", "data/gosha.sqlite3"))
 MODEL = os.getenv("MODEL", "deepseek/deepseek-chat")
-OWNER_ID = int(os.getenv("OWNER_ID", "0"))
+def read_owner_id(environ=None):
+    env = os.environ if environ is None else environ
+    primary = str(env.get("OWNER_ID", "")).strip()
+    legacy = str(env.get("ownerId", "")).strip()
+    raw = primary if primary not in ("", "0") else (legacy or "0")
+    try:
+        owner = int(raw)
+    except ValueError:
+        raise SystemExit("OWNER_ID должен быть числом из команды /myid, без @ и других символов") from None
+    if owner < 0:
+        raise SystemExit("OWNER_ID должен быть положительным Telegram ID")
+    return owner
+
+
+OWNER_ID = read_owner_id()
 PAYMENTS_ENABLED = os.getenv("ENABLE_PAYMENTS", "false").lower() == "true"
 VOLUME_PATH = os.getenv("RAILWAY_VOLUME_MOUNT_PATH", "")
 COOLDOWN = int(os.getenv("COOLDOWN_SECONDS", "5"))
@@ -206,6 +220,18 @@ def payments_ready():
     return DB.resolve().is_relative_to(Path(VOLUME_PATH).resolve())
 
 
+def role_name(uid, state):
+    if OWNER_ID > 0 and uid == OWNER_ID:
+        return "Owner"
+    return "Pro" if state.get('pro') else "Бесплатная"
+
+
+def role_line(uid, state):
+    role = role_name(uid, state)
+    icon = {"Owner": "👑", "Pro": "⭐", "Бесплатная": "🆓"}[role]
+    return f"{icon} Роль: <b>{role}</b>"
+
+
 def utc_date(ts):
     return datetime.fromtimestamp(ts, timezone.utc).strftime("%d.%m.%Y %H:%M UTC")
 
@@ -284,7 +310,7 @@ HELP = (
     "🆓 Бесплатно: 10 успешных ответов за скользящие 60 минут. "
     "Освободившийся запрос возвращается через час после его использования.\n"
     "⭐ Pro: 5 звёзд → 7 дней без почасовой квоты.\n\n"
-    "/menu — меню · /pro — доступ\n/soft · /hard · /raw — режимы\n"
+    "/menu — меню · /pro — доступ · /role — роль\n/soft · /hard · /raw — режимы\n"
     "/reset — забыть диалог · /delete — удалить данные\n"
     "/terms — условия · /privacy — данные\n/paysupport текст — помощь с оплатой\n"
     f"Ответы — до {OUTPUT_CHARS} символов. Пауза между запросами: {COOLDOWN} с."
@@ -320,12 +346,12 @@ async def show_menu(message, uid, edit=False):
         quota = f"⭐ <b>Pro до {utc_date(state['until'])}</b>" if state['pro'] else f"🆓 <b>{state['remaining']}/10</b> запросов за последний час"
         caption = (
             "<b>ГОША · коротко и в лицо</b>\n\n"
-            f"🎛 Твой режим: <b>{MODE_NAMES[mode]}</b>\n{quota}\n\n"
+            f"{role_line(uid, state)}\n🎛 Твой режим: <b>{MODE_NAMES[mode]}</b>\n{quota}\n\n"
             "Пиши прямо в чат. Меньше церемоний — больше дела."
         )
         kb = menu_keyboard(mode, state['pro'])
     else:
-        caption, kb = WELCOME, consent_keyboard()
+        caption, kb = WELCOME + "\n\n" + role_line(uid, state), consent_keyboard()
     if edit:
         try:
             if message.photo:
@@ -345,7 +371,7 @@ async def show_pro(message, uid):
     state = await bill("status", uid)
     current = f"\n✅ <b>Уже активен до {utc_date(state['until'])}</b>\n" if state['pro'] else ""
     text = (
-        "<b>⭐ ГОША PRO</b>\n\n"
+        "<b>⭐ ГОША PRO</b>\n" + role_line(uid, state) + "\n\n" +
         "∞ Без почасовой квоты\n🗓 7 дней доступа\n💫 Всего 5 Telegram Stars\n"
         "🔁 Без автосписаний\n" + current +
         f"\nПауза {COOLDOWN} с и защита от перегрузки остаются. "
@@ -461,6 +487,12 @@ async def clear_handler(message: Message):
     if action == "delete":
         text = "Переписка, настройки и согласие удалены. Оплаченный срок, платёжный журнал и временные счётчики сохраняются. Подробнее: /privacy."
     await message.answer(text, reply_markup=back_keyboard())
+
+
+@router.message(Command("role"))
+async def role_handler(message: Message):
+    state = await bill("status", message.from_user.id)
+    await message.answer(role_line(message.from_user.id, state), parse_mode="HTML", reply_markup=back_keyboard())
 
 
 @router.message(Command("myid"))
@@ -695,6 +727,7 @@ async def main():
         await bot.set_my_commands([
             BotCommand(command="menu", description="🎛 Главное меню"),
             BotCommand(command="pro", description="⭐ Pro · 7 дней за 5 Stars"),
+            BotCommand(command="role", description="👤 Моя роль"),
             BotCommand(command="hard", description="🔥 Жёстко"),
             BotCommand(command="soft", description="😌 Без мата"),
             BotCommand(command="raw", description="💀 Без фильтров"),
@@ -704,7 +737,7 @@ async def main():
             BotCommand(command="privacy", description="🔒 О данных"),
         ])
         await bot.set_chat_menu_button(menu_button=MenuButtonCommands())
-        logging.warning("Gosha v3 started; rolling quota and 7-day Stars Pro enabled; payments=%s", payments_ready())
+        logging.warning("Gosha v4 started; roles Free/Pro/Owner enabled; payments=%s", payments_ready())
         await dp.start_polling(bot, allowed_updates=["message", "callback_query", "pre_checkout_query"])
     finally:
         task.cancel()
