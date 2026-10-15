@@ -6,6 +6,7 @@ import re
 import secrets
 import math
 import hashlib
+from html import escape
 import billing
 import sqlite3
 import time
@@ -119,6 +120,8 @@ def db_init():
     with closing(sqlite3.connect(DB, timeout=10)) as con, con:
         con.execute("PRAGMA journal_mode=WAL")
         con.executescript("""
+        CREATE TABLE IF NOT EXISTS bot_members (user_id INTEGER PRIMARY KEY, username TEXT);
+        CREATE TABLE IF NOT EXISTS bot_registry_state (key TEXT PRIMARY KEY, value TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS bot_assets (
             bot_id INTEGER PRIMARY KEY, avatar_hash TEXT NOT NULL
         );
@@ -136,6 +139,13 @@ def db_init():
             last_request REAL NOT NULL, PRIMARY KEY(user_id, day)
         );
         """)
+        # Import only IDs already held by this bot, once. Unknown names stay unknown.
+        if not con.execute("SELECT 1 FROM bot_registry_state WHERE key='legacy_import_v1'").fetchone():
+            tables = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            for table in ("users", "messages", "usage", "permanent_bonuses", "hour_usage", "pro_entitlements", "pro_orders", "pro_charges"):
+                if table in tables:
+                    con.execute(f'INSERT OR IGNORE INTO bot_members(user_id) SELECT DISTINCT user_id FROM "{table}" WHERE user_id > 0')
+            con.execute("INSERT OR IGNORE INTO bot_registry_state VALUES('legacy_import_v1','done')")
 
 
 def db_run(action, uid=0, value=None):
@@ -143,6 +153,21 @@ def db_run(action, uid=0, value=None):
     day = datetime.now(timezone.utc).date().isoformat()
     now = time.time()
     with closing(sqlite3.connect(DB, timeout=10)) as con, con:
+        if action == "member_seen":
+            if uid > 0:
+                username = str(value).lstrip("@")[:32] if value else None
+                con.execute("INSERT INTO bot_members(user_id,username) VALUES(?,?) ON CONFLICT(user_id) DO UPDATE SET username=excluded.username", (uid, username))
+            return
+        if action in ("members", "member"):
+            if OWNER_ID <= 0 or uid != OWNER_ID:
+                raise PermissionError("Owner-only roster")
+            if action == "member":
+                return con.execute("SELECT user_id,username FROM bot_members WHERE user_id=?", (int(value),)).fetchone()
+            total = con.execute("SELECT COUNT(*) FROM bot_members").fetchone()[0]
+            pages = max(1, (total + OWNER_PAGE_SIZE - 1) // OWNER_PAGE_SIZE)
+            page = min(max(0, int(value or 0)), pages - 1)
+            rows = con.execute("SELECT user_id,username FROM bot_members ORDER BY user_id LIMIT ? OFFSET ?", (OWNER_PAGE_SIZE, page * OWNER_PAGE_SIZE)).fetchall()
+            return {"rows": rows, "total": total, "page": page, "pages": pages}
         if action == "asset_get":
             row = con.execute("SELECT avatar_hash FROM bot_assets WHERE bot_id=?", (uid,)).fetchone()
             return row[0] if row else None
@@ -165,6 +190,7 @@ def db_run(action, uid=0, value=None):
         elif action == "delete":
             con.execute("DELETE FROM messages WHERE user_id=?", (uid,))
             con.execute("DELETE FROM users WHERE user_id=?", (uid,))
+            con.execute("DELETE FROM bot_members WHERE user_id=?", (uid,))
             # Keep today's abuse/budget counter until next UTC day.
         elif action == "history":
             rows = con.execute("SELECT role,content FROM messages WHERE user_id=? "
@@ -232,6 +258,8 @@ class UserLockMiddleware(BaseMiddleware):
         entry[1] += 1
         try:
             async with entry[0]:
+                if not getattr(user, "is_bot", False):
+                    await store("member_seen", user.id, getattr(user, "username", None))
                 return await handler(event, data)
         finally:
             entry[1] -= 1
@@ -331,13 +359,15 @@ def consent_keyboard():
     ])
 
 
-def menu_keyboard(mode="hard", pro=False):
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [button(("✓ " if key == mode else "") + label, "mode:" + key)
-         for key, label in MODE_NAMES.items()],
+def menu_keyboard(mode="hard", pro=False, uid=None):
+    rows = [
+        [button(("✓ " if key == mode else "") + label, "mode:" + key) for key, label in MODE_NAMES.items()],
         [button("⭐ Мой Pro · продлить" if pro else f"⭐ Pro · 7 дней за {billing.PRICE} ⭐", "ui:pro")],
-        [button("❔ Как общаться", "ui:help"), button("🔒 О данных", "ui:privacy")],
-    ])
+    ]
+    if OWNER_ID > 0 and uid == OWNER_ID:
+        rows.append([button("🛠 Меню бота", "admin:users:0")])
+    rows.append([button("❔ Как общаться", "ui:help"), button("🔒 О данных", "ui:privacy")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def back_keyboard():
@@ -359,10 +389,14 @@ PRIVACY = (
     "Не отправляй пароли и чужие личные данные.\n\n"
     "Локально: Telegram ID, согласие, режим и последние 24 сообщения. "
     "Тексты старше 30 дней очищаются ежечасно.\n"
+    "Владелец видит список пользователей: Telegram ID и доступный юзернейм. "
+    "Юзернейм обновляется при обращении к основному боту; переписка в эту таблицу не входит. "
+    "/delete также удаляет запись из списка до следующего обращения. "
     "Для квоты сохраняются отметки бесплатных запросов за последний час. "
     "Для постоянного бонуса — Telegram ID и дата получения; это не история переписки. "
     "Для Pro — заказы, подтверждения платежей, сроки доступа и возвраты. "
-    "Финансовый журнал не удаляется автоматически командой /delete.\n\n"
+    "Также сохраняются ID получателя и владельца, дата и срок подарочного Pro. "
+    "Финансовый журнал и записи выданных подарков не удаляются автоматически командой /delete.\n\n"
     "/reset — стереть переписку. /delete — также настройки и согласие. "
     "Активный оплаченный доступ, записи платежей, постоянный бонус к квоте и временные антиспам-счётчики сохраняются. "
     "Старый дневной счётчик предыдущей версии очищается после смены дня UTC.\n\n"
@@ -438,7 +472,7 @@ async def show_menu(message, uid, edit=False):
             f"{role_line(uid, state)}\n🎛 Твой режим: <b>{MODE_NAMES[mode]}</b>\n{quota}{bonus_line}\n\n"
             "Пиши прямо в чат. Меньше церемоний — больше дела."
         )
-        kb = menu_keyboard(mode, state['pro'])
+        kb = menu_keyboard(mode, state['pro'], uid)
     else:
         caption, kb = WELCOME + "\n\n" + role_line(uid, state), consent_keyboard()
     if edit:
@@ -595,7 +629,7 @@ async def mode_handler(message: Message):
         return
     mode = message.text.split()[0].split("@")[0][1:]
     await store("mode", uid, mode)
-    await message.answer(f"{MODE_NAMES[mode]} — включён.", reply_markup=menu_keyboard(mode, (await bill('status', uid))['pro']))
+    await message.answer(f"{MODE_NAMES[mode]} — включён.", reply_markup=menu_keyboard(mode, (await bill('status', uid))['pro'], uid))
 
 
 @router.message(Command("reset", "delete"))
@@ -604,7 +638,7 @@ async def clear_handler(message: Message):
     await store(action, message.from_user.id)
     text = "🧹 Переписка забыта. Режим и лимит не изменились."
     if action == "delete":
-        text = "Переписка, настройки и согласие удалены. Оплаченный срок, платёжный журнал, постоянный бонус и временные счётчики сохраняются. Подробнее: /privacy."
+        text = "Переписка, настройки, согласие и запись в списке пользователей удалены. Оплаченный срок, платёжный журнал, постоянный бонус и временные счётчики сохраняются. Подробнее: /privacy."
     await message.answer(text, reply_markup=back_keyboard())
 
 
@@ -854,6 +888,155 @@ async def unsupported(message: Message):
     await message.answer("Пока только текст.")
 
 
+OWNER_PAGE_SIZE = 10
+
+
+def owner_admin_allowed(message, uid):
+    # Never deliver the roster to a forwarded button in somebody else's chat.
+    return (OWNER_ID > 0 and uid == OWNER_ID and message.chat.id == OWNER_ID
+            and message.chat.type == ChatType.PRIVATE)
+
+
+def members_table(rows):
+    labels = [("@" + username) if username else "—" for _, username in rows]
+    w = max([len("Юзернейм")] + [len(label) for label in labels])
+    iw = max([len("ID")] + [len(str(uid)) for uid, _ in rows])
+    lines = ["┌" + "─" * (w + 2) + "┬" + "─" * (iw + 2) + "┐",
+             f"│ {'Юзернейм':<{w}} │ {'ID':>{iw}} │",
+             "├" + "─" * (w + 2) + "┼" + "─" * (iw + 2) + "┤"]
+    for (uid, _), label in zip(rows, labels):
+        lines.append(f"│ {label:<{w}} │ {str(uid):>{iw}} │")
+    lines.append("└" + "─" * (w + 2) + "┴" + "─" * (iw + 2) + "┘")
+    return "<pre>" + escape("\n".join(lines)) + "</pre>"
+
+
+async def show_bot_admin(message, uid, page=0, edit=False):
+    if not owner_admin_allowed(message, uid):
+        await message.answer("⛔ Это меню доступно только Owner.")
+        return
+    roster = await store("members", uid, page)
+    page = roster['page']
+    text = ("<b>👑 Меню бота</b>\n"
+            f"👥 Пользователи: <b>{roster['total']}</b>\n\n" + members_table(roster['rows']) +
+            f"\n\n📄 Страница {page + 1}/{roster['pages']}\n"
+            "— = юзернейм не указан или пока неизвестен.\n"
+            "🎁 Справа от каждого пользователя ниже — подарок Pro на 24 часа.")
+    rows = []
+    for recipient_id, username in roster['rows']:
+        label = ("@" + username) if username else "Без юзернейма"
+        rows.append([button(f"👤 {label} · {recipient_id}", f"admin:users:{page}"),
+                     button("🎁 Pro на 1 день", f"admin:giftstart:{recipient_id}:{page}")])
+    nav = []
+    if page > 0:
+        nav.append(button("⬅️ Назад", f"admin:users:{page - 1}"))
+    nav.append(button("🔄 Обновить", f"admin:users:{page}"))
+    if page + 1 < roster['pages']:
+        nav.append(button("Далее ➡️", f"admin:users:{page + 1}"))
+    rows += [nav, [button("← Главное меню", "ui:menu")]]
+    keyboard = InlineKeyboardMarkup(inline_keyboard=rows)
+    if not roster['total']:
+        text += "\nПока нет сохранённых пользователей."
+    if edit:
+        try:
+            await message.edit_text(text, parse_mode="HTML", reply_markup=keyboard)
+            return
+        except TelegramBadRequest as error:
+            if "message is not modified" in error.message.lower():
+                return
+            logging.warning("Admin roster edit not applied; sending a fresh table")
+    await message.answer(text, parse_mode="HTML", reply_markup=keyboard)
+
+
+def admin_page(text):
+    if not text.isascii() or not text.isdecimal() or len(text) > 10:
+        return None
+    return int(text)
+
+
+@router.callback_query(F.data.startswith("admin:users:"))
+async def admin_users_callback(query: CallbackQuery):
+    uid = query.from_user.id
+    if not owner_admin_allowed(query.message, uid):
+        await query.message.answer("⛔ Это меню доступно только Owner.")
+        return
+    page = admin_page(query.data.rsplit(":", 1)[-1])
+    if page is None:
+        await query.message.answer("Открой меню заново: /menu.")
+        return
+    await show_bot_admin(query.message, uid, page, edit=not bool(getattr(query.message, 'photo', None)) and hasattr(query.message, 'edit_text'))
+
+
+@router.callback_query(F.data.startswith("admin:giftstart:"))
+async def admin_gift_start(query: CallbackQuery):
+    owner = query.from_user.id
+    if not owner_admin_allowed(query.message, owner):
+        await query.message.answer("⛔ Подарки может выдавать только Owner.")
+        return
+    parts = query.data.split(":")
+    if len(parts) != 4 or not parts[2].isascii() or not parts[2].isdecimal() or len(parts[2]) > 19:
+        await query.message.answer("Открой меню заново: /menu.")
+        return
+    recipient = int(parts[2])
+    page = admin_page(parts[3])
+    if recipient <= 0 or recipient > 9223372036854775807 or page is None:
+        await query.message.answer("Открой меню заново: /menu.")
+        return
+    member = await store("member", owner, recipient)
+    if not member:
+        await query.message.answer("Пользователь не найден. Обнови таблицу.")
+        return
+    token = secrets.token_urlsafe(16)
+    await bill("gift_prepare", owner, {"token": token, "recipient_id": recipient})
+    username = "@" + member[1] if member[1] else "без юзернейма"
+    state = await bill("status", recipient)
+    current = f"Текущий Pro до {utc_date(state['until'])}." if state['pro'] else "Сейчас активного Pro нет."
+    text = ("<b>🎁 Подарить Pro на 1 день?</b>\n\n"
+            f"👤 {escape(username)}\n🆔 <code>{recipient}</code>\n\n"
+            f"{current}\nДобавится 24 часа: к действующему сроку или с момента подтверждения.\n"
+            "⭐ Звёзды не списываются. Подтверждение действует 10 минут.")
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [button("✅ Да, подарить 1 день", f"admin:giftconfirm:{token}:{page}")],
+        [button("← К таблице", f"admin:users:{page}")],
+    ])
+    await query.message.answer(text, parse_mode="HTML", reply_markup=keyboard)
+
+
+@router.callback_query(F.data.startswith("admin:giftconfirm:"))
+async def admin_gift_confirm(query: CallbackQuery):
+    owner = query.from_user.id
+    if not owner_admin_allowed(query.message, owner):
+        await query.message.answer("⛔ Подарки может выдавать только Owner.")
+        return
+    parts = query.data.split(":")
+    if len(parts) != 4 or not re.fullmatch(r"[A-Za-z0-9_-]{16,40}", parts[2]):
+        await query.message.answer("Подтверждение недействительно. Открой таблицу заново.")
+        return
+    page = admin_page(parts[3])
+    if page is None:
+        await query.message.answer("Открой меню заново: /menu.")
+        return
+    result = await bill("gift_grant", owner, parts[2])
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[[button("← К таблице", f"admin:users:{page}")]])
+    if result['state'] == 'duplicate':
+        await query.message.answer("🎁 Этот подарок уже выдан. Повторно срок не добавлен.", reply_markup=keyboard)
+        return
+    if result['state'] != 'granted':
+        await query.message.answer("Подтверждение истекло или недействительно. Открой таблицу и выбери подарок заново.", reply_markup=keyboard)
+        return
+    recipient = result['user_id']
+    expiry = utc_date(result['until'])
+    delivered = True
+    try:
+        await query.message.bot.send_message(recipient,
+            f"🎁 Владелец подарил тебе Pro на 1 день!\nPro активен до {expiry}.\nОткрыть меню: /menu", parse_mode=None)
+    except TelegramAPIError:
+        delivered = False
+    text = f"✅ Подарен 1 день Pro.\n🆔 {recipient}\n🗓 Pro до {expiry}."
+    if not delivered:
+        text += "\nУведомление не доставлено, но доступ сохранён."
+    await query.message.answer(text, reply_markup=keyboard)
+
+
 @router.callback_query(F.data.startswith("mode:"))
 async def mode_callback(query: CallbackQuery):
     mode = query.data.split(":", 1)[1]
@@ -1001,7 +1184,7 @@ def backup_before_price_restore():
     if not folder.resolve().is_relative_to(Path(VOLUME_PATH).resolve()):
         raise RuntimeError("Backup directory must stay inside Railway Volume")
     folder.mkdir(parents=True, exist_ok=True, mode=0o700)
-    target = folder / (source.name + ".before-pro5-v9.sqlite3")
+    target = folder / (source.name + ".before-owner-menu-v10.sqlite3")
 
     def verify(path):
         if path.is_symlink():
@@ -1087,7 +1270,7 @@ async def main():
                 BotCommand(command="terms", description="📜 Условия"),
                 BotCommand(command="paysupport", description="🛟 Помощь с покупкой"),
             ])
-        logging.warning("Anfisa v9 started; bots=%s payments=%s owner_has_no_quota=True", len(bots), payments_ready())
+        logging.warning("Anfisa v10 started; bots=%s payments=%s owner_has_no_quota=True", len(bots), payments_ready())
         if not payments_ready():
             logging.warning("Payment setup checks failed: %s", ", ".join(name for name, ok, _ in payment_checks() if not ok))
         await dp.start_polling(*bots, allowed_updates=["message", "callback_query", "pre_checkout_query"])

@@ -9,6 +9,8 @@ PRICE = 5  # Regular price restored. Already confirmed orders keep their recorde
 DURATION = 7 * 24 * 60 * 60
 FREE_LIMIT = 20
 GOSHA_BONUS = 5
+GIFT_DURATION = 24 * 60 * 60
+GIFT_TTL = 10 * 60
 WINDOW = 60 * 60
 ORDER_TTL = 30 * 60
 
@@ -50,6 +52,12 @@ def init(path):
         CREATE TABLE IF NOT EXISTS rate_limits (
             user_id INTEGER PRIMARY KEY, last_ts REAL NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS pro_gifts (
+            gift_id TEXT PRIMARY KEY, user_id INTEGER NOT NULL, owner_id INTEGER NOT NULL,
+            created REAL NOT NULL, duration_seconds INTEGER NOT NULL DEFAULT 86400,
+            granted_at REAL
+        );
+        CREATE INDEX IF NOT EXISTS pro_gifts_user ON pro_gifts(user_id, granted_at);
         CREATE TABLE IF NOT EXISTS permanent_bonuses (
             user_id INTEGER PRIMARY KEY, gosha_claimed_at REAL NOT NULL
         );
@@ -78,8 +86,12 @@ def pro_until(con, uid):
 
 def recompute(con, uid):
     expiry = 0.0
-    for row in con.execute("SELECT paid_at FROM pro_charges WHERE user_id=? AND state='granted' ORDER BY paid_at,charge_id", (uid,)):
-        expiry = max(expiry, row[0]) + DURATION
+    events = [(row[0], 0, row[1], DURATION) for row in con.execute(
+        "SELECT paid_at,charge_id FROM pro_charges WHERE user_id=? AND state='granted'", (uid,))]
+    events += [(row[0], 1, row[1], row[2]) for row in con.execute(
+        "SELECT granted_at,gift_id,duration_seconds FROM pro_gifts WHERE user_id=? AND granted_at IS NOT NULL", (uid,))]
+    for when, _, event_id, duration in sorted(events):
+        expiry = max(expiry, when) + duration
     con.execute('INSERT INTO pro_entitlements VALUES(?,?) ON CONFLICT(user_id) DO UPDATE SET until_ts=excluded.until_ts', (uid, expiry))
     return expiry
 
@@ -99,8 +111,26 @@ def snapshot(con, uid, now):
 def run(path, action, uid=0, value=None, now=None):
     now = time.time() if now is None else float(now)
     with closing(connect(path)) as con, con:
-        if action in ('reserve', 'payment', 'refund', 'precheck', 'gosha_bonus'):
+        if action in ('reserve', 'payment', 'refund', 'precheck', 'gosha_bonus', 'gift_grant'):
             con.execute('BEGIN IMMEDIATE')
+        if action == 'gift_prepare':
+            recipient = int(value['recipient_id'])
+            if uid <= 0 or recipient <= 0:
+                raise ValueError('Gift owner and recipient must be positive IDs')
+            con.execute('INSERT INTO pro_gifts(gift_id,user_id,owner_id,created,duration_seconds) VALUES(?,?,?,?,?)',
+                        (value['token'], recipient, uid, now, GIFT_DURATION))
+            return value['token']
+        if action == 'gift_grant':
+            gift = con.execute('SELECT * FROM pro_gifts WHERE gift_id=? AND owner_id=?', (value, uid)).fetchone()
+            if not gift:
+                return {'state': 'invalid'}
+            if gift['granted_at'] is not None:
+                return {'state': 'duplicate', 'user_id': gift['user_id'], 'until': pro_until(con, gift['user_id'])}
+            if now - gift['created'] > GIFT_TTL:
+                return {'state': 'expired'}
+            con.execute('UPDATE pro_gifts SET granted_at=? WHERE gift_id=?', (now, value))
+            until = recompute(con, gift['user_id'])
+            return {'state': 'granted', 'user_id': gift['user_id'], 'until': until}
         if action == 'status':
             return snapshot(con, uid, now)
         if action == 'gosha_bonus':
@@ -185,6 +215,7 @@ def run(path, action, uid=0, value=None, now=None):
         if action == 'cleanup':
             con.execute('DELETE FROM hour_usage WHERE at_ts<=?', (now - WINDOW,))
             con.execute('DELETE FROM rate_limits WHERE last_ts<=?', (now - WINDOW,))
+            con.execute('DELETE FROM pro_gifts WHERE granted_at IS NULL AND created<?', (now - 86400,))
             # Unpaid checkout state is not erased: delayed valid payments must remain matchable.
             con.execute("DELETE FROM pro_orders WHERE state='new' AND created<?", (now - 86400,))
             return
