@@ -71,6 +71,7 @@ OUTPUT_CHARS = 220
 BASE_DIR = Path(__file__).resolve().parent
 WELCOME_PHOTO = BASE_DIR / "welcome.jpg"
 AVATAR_PHOTO = BASE_DIR / "avatar.jpg"
+GOSHA_PHOTO = BASE_DIR / "gosha.jpg"
 
 SYSTEM = """Ты — Анфиса, вымышленная дерзкая ИИ-собеседница. По-русски, на «ты». Говори о себе в женском роде.
 Не рассказывай анекдоты, истории, притчи и мотивационные лекции. Не начинай
@@ -806,6 +807,24 @@ async def generate(message, uid, text):
         in_flight -= 1
         if reservation is not None and not delivered:
             await bill("release", uid, reservation)
+
+
+# Hidden easter egg: public in the MAIN bot, intentionally absent from commands/menu.
+GOSHA_TRIGGER = re.compile(r"^\s*/?(?:гоша|gosha)(?:@[A-Za-z0-9_]+)?\s*$", re.IGNORECASE)
+GOSHA_CAPTION = (
+    "🗿 Гоша найден.\n\n"
+    "Анфиса отвечает за разговоры. Гоша — за сделки, после которых "
+    "даже калькулятор просит перекур."
+)
+
+
+@router.message(F.text.regexp(GOSHA_TRIGGER))
+async def gosha_easter_egg(message: Message):
+    # No consent, Owner or Pro gate, generation request, or quota reservation.
+    if GOSHA_PHOTO.is_file():
+        await message.answer_photo(FSInputFile(GOSHA_PHOTO), caption=GOSHA_CAPTION, parse_mode=None)
+    else:
+        await message.answer("Гоша ушёл за картинкой. Скоро вернётся 🗿", parse_mode=None)
 
 
 @router.message(F.text.startswith("/"))
