@@ -15,10 +15,11 @@ from pathlib import Path
 from aiogram import Bot, Dispatcher, F, Router, BaseMiddleware
 from aiogram.enums import ChatAction, ChatType
 from aiogram.exceptions import TelegramBadRequest, TelegramAPIError
-from aiogram.filters import Command, CommandStart
+from aiogram.filters import BaseFilter, Command, CommandStart
 from aiogram.types import (Message, CallbackQuery, InlineKeyboardButton,
                            InlineKeyboardMarkup, FSInputFile, BotCommand, MenuButtonCommands,
                            PreCheckoutQuery, LabeledPrice)
+from aiogram.utils.token import TokenValidationError
 from dotenv import load_dotenv
 from openai import AsyncOpenAI, APIError
 
@@ -34,6 +35,8 @@ load_dotenv()
 # OPENROUTER_API_KEY=твой_ключ_OpenRouter
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
+# Отдельный бот от BotFather; ключ хранить только в Railway Variables.
+PAYMENT_BOT_TOKEN = os.getenv("PAYMENT_BOT_TOKEN", "").strip()
 # ================================================
 
 # Для сохранения истории при перезапусках DB_PATH должен указывать
@@ -168,9 +171,28 @@ async def store(action, uid=0, value=None):
     return await asyncio.to_thread(db_run, action, uid, value)
 
 
-router = Router()
-router.message.filter(F.chat.type == ChatType.PRIVATE)
-router.callback_query.filter(F.message.chat.type == ChatType.PRIVATE)
+MAIN_BOT = None
+PAYMENT_BOT = None
+MAIN_USERNAME = ""
+PAYMENT_USERNAME = ""
+
+
+class BotRoleFilter(BaseFilter):
+    def __init__(self, payment=False):
+        self.payment = payment
+
+    async def __call__(self, event, bot: Bot):
+        expected = PAYMENT_BOT if self.payment else MAIN_BOT
+        return expected is not None and bot.id == expected.id
+
+
+router = Router(name="gosha-main")
+router.message.filter(F.chat.type == ChatType.PRIVATE, BotRoleFilter())
+router.callback_query.filter(F.message.chat.type == ChatType.PRIVATE, BotRoleFilter())
+router.pre_checkout_query.filter(BotRoleFilter())
+pay_router = Router(name="gosha-payments")
+pay_router.message.filter(F.chat.type == ChatType.PRIVATE, BotRoleFilter(payment=True))
+pay_router.pre_checkout_query.filter(BotRoleFilter(payment=True))
 client = None
 in_flight = 0
 ERROR_MESSAGE = "Сервера сдохли"
@@ -214,7 +236,9 @@ async def bill(action, uid=0, value=None):
 
 
 def payments_ready():
-    if not (PAYMENTS_ENABLED and OWNER_ID > 0 and DB.is_absolute() and VOLUME_PATH):
+    if not (PAYMENTS_ENABLED and OWNER_ID > 0 and DB.is_absolute() and VOLUME_PATH
+            and MAIN_BOT is not None and PAYMENT_BOT is not None
+            and MAIN_USERNAME and PAYMENT_USERNAME):
         return False
     # Railway supplies this mount path only for an attached volume.
     return DB.resolve().is_relative_to(Path(VOLUME_PATH).resolve())
@@ -299,7 +323,7 @@ TERMS = (
     "Покупку обслуживает владелец этого бота, не поддержка Telegram. "
     "При возврате оплаченный срок пересчитывается. Возвраты и обязательные права "
     "покупателя определяются применимым законодательством.\n\n"
-    "Кнопка «Согласен · оплатить» подтверждает принятие этих условий."
+    "Кнопка «Оплатить» в основном боте подтверждает принятие этих условий. Счёт выставляет отдельный платёжный бот этого же сервиса."
 )
 HELP = (
     "<b>❔ Как общаться</b>\n\n"
@@ -309,7 +333,7 @@ HELP = (
     "При реальном кризисе — поддержка, не добивание.\n\n"
     "🆓 Бесплатно: 10 успешных ответов за скользящие 60 минут. "
     "Освободившийся запрос возвращается через час после его использования.\n"
-    "⭐ Pro: 5 звёзд → 7 дней без почасовой квоты.\n\n"
+    "⭐ Pro: 5 звёзд → 7 дней без почасовой квоты. Оплата — в отдельном боте.\n👑 Owner — без квоты и паузы между запросами.\n\n"
     "/menu — меню · /pro — доступ · /role — роль\n/soft · /hard · /raw — режимы\n"
     "/reset — забыть диалог · /delete — удалить данные\n"
     "/terms — условия · /privacy — данные\n/paysupport текст — помощь с оплатой\n"
@@ -343,7 +367,10 @@ async def show_menu(message, uid, edit=False):
     state = await bill("status", uid)
     mode = row[1] if agreed and row[1] in MODES else "hard"
     if agreed:
-        quota = f"⭐ <b>Pro до {utc_date(state['until'])}</b>" if state['pro'] else f"🆓 <b>{state['remaining']}/10</b> запросов за последний час"
+        if OWNER_ID > 0 and uid == OWNER_ID:
+            quota = "∞ <b>Owner: без квоты и паузы между запросами</b>"
+        else:
+            quota = f"⭐ <b>Pro до {utc_date(state['until'])}</b>" if state['pro'] else f"🆓 <b>{state['remaining']}/10</b> запросов за последний час"
         caption = (
             "<b>ГОША · коротко и в лицо</b>\n\n"
             f"{role_line(uid, state)}\n🎛 Твой режим: <b>{MODE_NAMES[mode]}</b>\n{quota}\n\n"
@@ -367,24 +394,39 @@ async def show_menu(message, uid, edit=False):
         await message.answer(caption, parse_mode="HTML", reply_markup=kb)
 
 
+def main_bot_keyboard(pro=False):
+    if not MAIN_USERNAME:
+        return back_keyboard()
+    link = f"https://t.me/{MAIN_USERNAME}?start={'pro' if pro else 'paid'}"
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="← Открыть Pro в основном боте" if pro else "← Вернуться к Гоше", url=link)
+    ]])
+
+
 async def show_pro(message, uid):
+    if not await consent(message, uid):
+        return
     state = await bill("status", uid)
-    current = f"\n✅ <b>Уже активен до {utc_date(state['until'])}</b>\n" if state['pro'] else ""
+    current = f"\n✅ <b>Активен до {utc_date(state['until'])}</b>\n" if state['pro'] else ""
+    if OWNER_ID > 0 and uid == OWNER_ID:
+        current = "\n👑 <b>У Owner уже нет квоты и паузы. Покупка для себя не требуется.</b>\n"
     text = (
-        "<b>⭐ ГОША PRO</b>\n" + role_line(uid, state) + "\n\n" +
+        "<b>⭐ ГОША PRO</b>\n" + role_line(uid, state) + "\n\n"
         "∞ Без почасовой квоты\n🗓 7 дней доступа\n💫 Всего 5 Telegram Stars\n"
         "🔁 Без автосписаний\n" + current +
-        f"\nПауза {COOLDOWN} с и защита от перегрузки остаются. "
+        f"\nПауза {COOLDOWN} с и защита от перегрузки остаются для обычного Pro. "
         "Повторная покупка продлевает срок на 7 дней.\n\n"
-        "Прочитай условия ниже. Нажимая «Согласен · оплатить», принимаешь /terms. "
-        "Вопросы по покупке: /paysupport."
+        "Прочитай условия. Нажимая «Оплатить», принимаешь их. "
+        "Оплата откроется в отдельном боте: нажми там «Старт» — появится счёт Telegram."
     )
     rows = []
     if payments_ready():
-        rows.append([button("✅ Согласен · оплатить 5 ⭐", "pro:buy")])
+        payload = "gl_" + secrets.token_urlsafe(24)
+        await bill("create_order", uid, {'payload': payload, 'merchant_id': PAYMENT_BOT.id, 'kind': 'link'})
+        rows.append([InlineKeyboardButton(text="Оплатить ⭐ 5", url=f"https://t.me/{PAYMENT_USERNAME}?start={payload}")])
     else:
-        text += "\n\n⚙️ Продажи пока не включены владельцем."
-    rows += [[button("📜 Условия", "ui:terms"), button("🛟 Помощь", "ui:support")],
+        text += "\n\n⚙️ Оплата временно недоступна."
+    rows += [[button("📜 Прочитать условия", "ui:terms"), button("🛟 Помощь", "ui:support")],
              [button("← Главное меню", "ui:menu")]]
     kb = InlineKeyboardMarkup(inline_keyboard=rows)
     if PRO_PHOTO.is_file():
@@ -408,7 +450,8 @@ async def checkout(query: PreCheckoutQuery):
         row = await store("get", query.from_user.id)
         ok = bool(payments_ready() and row and row[0] and await bill(
             "precheck", query.from_user.id,
-            (query.invoice_payload, query.total_amount, query.currency)))
+            (query.invoice_payload, query.total_amount, query.currency,
+             query.bot.id, MAIN_BOT.id if MAIN_BOT else 0)))
     except Exception:
         logging.error("Checkout validation failed")
         ok = False
@@ -420,11 +463,12 @@ async def payment_received(message: Message):
     payment = message.successful_payment
     result = await bill("payment", message.from_user.id,
                         (payment.telegram_payment_charge_id, payment.invoice_payload,
-                         payment.total_amount, payment.currency))
+                         payment.total_amount, payment.currency,
+                         message.bot.id, MAIN_BOT.id if MAIN_BOT else 0))
     if result['state'] == 'duplicate':
         return
     if result['state'] == 'granted':
-        await message.answer(f"⭐ Pro включён до {utc_date(result['until'])}.\nПочасовая квота снята. Пиши.", reply_markup=back_keyboard())
+        await message.answer(f"⭐ Pro включён до {utc_date(result['until'])}.\nПочасовая квота снята. Пиши.", reply_markup=main_bot_keyboard())
         await notify_owner(message.bot, f"Оплата Pro: {payment.total_amount} Stars. Пользователь {message.from_user.id}.\nCharge: {payment.telegram_payment_charge_id}")
     elif result['state'] == 'orphan':
         await message.answer("Оплата получена, но не сопоставлена с заказом. Напиши /paysupport — владелец проверит платёж или оформит возврат.")
@@ -440,7 +484,8 @@ async def payment_refunded(message: Message):
         return
     charge = await bill("charge", value=refund.telegram_payment_charge_id)
     payer = charge['user_id'] if charge else message.from_user.id
-    until = await bill("refund", payer, refund.telegram_payment_charge_id)
+    until = await bill("refund", payer, (refund.telegram_payment_charge_id, message.bot.id,
+                                        MAIN_BOT.id if MAIN_BOT else 0))
     suffix = f"Pro остаётся до {utc_date(until)}." if until > time.time() else "Доступны бесплатные 10 запросов/час."
     await message.answer("Возврат учтён. " + suffix)
 
@@ -448,7 +493,14 @@ async def payment_refunded(message: Message):
 @router.message(CommandStart())
 @router.message(Command("menu", "mode"))
 async def start(message: Message):
-    await show_menu(message, message.from_user.id)
+    parts = (message.text or "").split(maxsplit=1)
+    arg = parts[1] if len(parts) == 2 else ""
+    if arg == "pro":
+        await show_pro(message, message.from_user.id)
+    elif arg == "terms":
+        await message.answer(TERMS, parse_mode="HTML", reply_markup=back_keyboard())
+    else:
+        await show_menu(message, message.from_user.id)
 
 
 @router.message(Command("agree"))
@@ -531,11 +583,18 @@ async def owner_handler(message: Message):
         await message.bot.send_message(int(parts[1]), "🛟 Ответ поддержки:\n" + parts[2][:3000], parse_mode=None)
         await message.answer("Отправлено.")
     elif command == "stars":
-        balance = await message.bot.get_my_star_balance()
-        await message.answer(f"Баланс бота: {balance.amount} ⭐")
+        merchants = [("Основной бот", MAIN_BOT), ("Платёжный бот", PAYMENT_BOT)]
+        if not any(merchant for _, merchant in merchants):
+            merchants = [("Этот бот", message.bot)]
+        lines = []
+        for label, merchant in merchants:
+            if merchant is not None:
+                balance = await merchant.get_my_star_balance()
+                lines.append(f"{label}: {balance.amount} ⭐")
+        await message.answer("\n".join(lines))
     elif command == "payments":
         rows = await bill("payments")
-        lines = [f"{r['user_id']} · {r['amount']} {r['currency']} · {r['state']}\n{r['charge_id']}" for r in rows]
+        lines = [f"{r['user_id']} · {r['amount']} {r['currency']} · {r['state']} · бот {r.get('merchant_id', 0)}\n{r['charge_id']}" for r in rows]
         await message.answer("Последние платежи:\n\n" + ("\n\n".join(lines) or "Пока нет."), parse_mode=None)
     elif command == "refund":
         if len(parts) < 2:
@@ -550,35 +609,72 @@ async def owner_handler(message: Message):
             await message.answer("Этот платёж уже возвращён.")
             return
         # The explicit owner command authorizes this financial action.
-        refunded = await message.bot.refund_star_payment(user_id=uid, telegram_payment_charge_id=parts[1])
+        merchant_id = charge.get('merchant_id', 0) if charge else message.bot.id
+        if charge and merchant_id == 0:
+            merchant = MAIN_BOT or message.bot
+        else:
+            merchant = next((b for b in (MAIN_BOT, PAYMENT_BOT, message.bot)
+                             if b is not None and b.id == merchant_id), None)
+        if merchant is None:
+            await message.answer("Не найден бот, который получил этот платёж. Проверь конфигурацию токенов.")
+            return
+        refunded = await merchant.refund_star_payment(user_id=uid, telegram_payment_charge_id=parts[1])
         if not refunded:
             await message.answer(ERROR_MESSAGE)
             return
-        await bill("refund", uid, parts[1])
+        await bill("refund", uid, (parts[1], merchant.id, MAIN_BOT.id if MAIN_BOT else 0))
         await message.answer("Возврат выполнен, срок Pro пересчитан.")
 
 
-async def create_invoice(message, uid):
+async def create_invoice(message, uid, link_payload=None):
     if not payments_ready():
-        await message.answer("Продажи ещё не включены владельцем.")
+        await message.answer("Оплата временно недоступна.", reply_markup=main_bot_keyboard(pro=True))
         return
-    if not await consent(message, uid):
+    if link_payload is None:
+        # Old main-bot callback buttons now open the new, separate-bot flow.
+        await show_pro(message, uid)
         return
-    payload = "gosha3:" + secrets.token_urlsafe(24)
-    await bill("create_order", uid, payload)
+    if message.bot.id != PAYMENT_BOT.id:
+        await show_pro(message, uid)
+        return
+    order = await bill("order", uid, link_payload)
+    valid = bool(order and order['kind'] == 'link' and order['merchant_id'] == PAYMENT_BOT.id
+                 and order['accepted_terms'] == 1 and time.time() - order['created'] <= billing.ORDER_TTL)
+    agreed = await store("get", uid)
+    if not valid or not agreed or not agreed[0]:
+        await message.answer("Ссылка устарела или предназначена другому пользователю. Открой Pro в основном боте и нажми «Оплатить» ещё раз.", reply_markup=main_bot_keyboard(pro=True))
+        return
+    # Each explicit Start creates a distinct invoice, not a reusable forwarded payment.
+    invoice_payload = "gi_" + secrets.token_urlsafe(24)
+    await bill("create_order", uid, {'payload': invoice_payload, 'merchant_id': PAYMENT_BOT.id, 'kind': 'invoice'})
     try:
         await message.bot.send_invoice(
             chat_id=uid, title="Гоша Pro · 7 дней",
-            description="7 дней без почасовой квоты. Разовая оплата 5 Stars, без автопродления. Защита от спама остаётся. Условия: /terms. Поддержка: /paysupport.",
-            payload=payload, provider_token="", currency="XTR",
+            description=f"7 дней доступа без почасовой квоты в @{MAIN_USERNAME}. Всего 5 Stars, без автосписаний. Защита от спама остаётся.",
+            payload=invoice_payload, provider_token="", currency="XTR",
             prices=[LabeledPrice(label="Pro · 7 дней", amount=billing.PRICE)],
             start_parameter="gosha-pro",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-                InlineKeyboardButton(text="Оплатить 5 ⭐", pay=True)]]),
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="Заплатить ⭐ 5", pay=True)],
+                [InlineKeyboardButton(text="Прочитать условия", url=f"https://t.me/{MAIN_USERNAME}?start=terms")]
+            ]),
         )
     except TelegramAPIError:
         logging.error("Invoice creation failed")
         await message.answer(ERROR_MESSAGE)
+
+
+async def payment_start(message: Message):
+    parts = (message.text or "").split(maxsplit=1)
+    payload = parts[1] if len(parts) == 2 else ""
+    if payload.startswith("gl_") and len(payload) <= 64:
+        await create_invoice(message, message.from_user.id, payload)
+    else:
+        await message.answer("⭐ Оплата Гоша Pro: 7 дней за 5 Telegram Stars. Открой Pro в основном боте и нажми «Оплатить» — сюда передастся твой заказ.", reply_markup=main_bot_keyboard(pro=True))
+
+
+async def payment_help(message: Message):
+    await message.answer("Это платёжный бот Гоши. Ссылка на счёт открывается кнопкой «Оплатить» в основном боте. По покупке: /paysupport и описание проблемы.", reply_markup=main_bot_keyboard(pro=True))
 
 
 async def generate(message, uid, text):
@@ -596,7 +692,9 @@ async def generate(message, uid, text):
     reservation = None
     delivered = False
     try:
-        permit = await bill("reserve", uid, COOLDOWN)
+        is_owner = OWNER_ID > 0 and uid == OWNER_ID
+        permit = await bill("reserve", uid, {'cooldown': 0 if is_owner else COOLDOWN,
+                                             'bypass_quota': is_owner})
         if not permit['ok']:
             if permit['reason'] == 'quota':
                 minutes = max(1, math.ceil((permit['next_slot'] - time.time()) / 60))
@@ -665,7 +763,7 @@ async def mode_callback(query: CallbackQuery):
 
 @router.callback_query(F.data == "pro:buy")
 async def buy_callback(query: CallbackQuery):
-    await create_invoice(query.message, query.from_user.id)
+    await show_pro(query.message, query.from_user.id)
 
 
 @router.callback_query(F.data.startswith("ui:"))
@@ -707,8 +805,37 @@ async def housekeeping():
         await asyncio.sleep(300)
 
 
+pay_router.pre_checkout_query.register(checkout)
+pay_router.message.register(payment_received, F.successful_payment)
+pay_router.message.register(payment_refunded, F.refunded_payment)
+pay_router.message.register(payment_start, CommandStart())
+pay_router.message.register(support_handler, Command("paysupport", "support"))
+pay_router.message.register(owner_handler, Command("reply", "stars", "payments", "refund"))
+pay_router.message.register(myid_handler, Command("myid"))
+pay_router.message.register(role_handler, Command("role"))
+pay_router.message.register(info_handler, Command("terms", "privacy"))
+pay_router.message.register(payment_help)
+
+
+async def configure_payment_bot(main_bot):
+    if not PAYMENT_BOT_TOKEN:
+        return None, ""
+    candidate = None
+    try:
+        candidate = Bot(token=PAYMENT_BOT_TOKEN)
+        if candidate.id == main_bot.id:
+            raise ValueError("Payment bot must differ from main bot")
+        info = await candidate.get_me()
+    except (TelegramAPIError, TokenValidationError, ValueError):
+        logging.error("Payment bot disabled; check PAYMENT_BOT_TOKEN: it must be a different valid bot")
+        if candidate is not None:
+            await candidate.session.close()
+        return None, ""
+    return candidate, info.username or ""
+
+
 async def main():
-    global client
+    global client, MAIN_BOT, PAYMENT_BOT, MAIN_USERNAME, PAYMENT_USERNAME
     if not TELEGRAM_BOT_TOKEN or not OPENROUTER_API_KEY:
         raise SystemExit("Задай TELEGRAM_BOT_TOKEN и OPENROUTER_API_KEY в Railway Variables")
     await asyncio.to_thread(db_init)
@@ -716,15 +843,21 @@ async def main():
     await store("cleanup")
     await bill("cleanup")
     client = AsyncOpenAI(api_key=OPENROUTER_API_KEY, base_url="https://openrouter.ai/api/v1", timeout=45, max_retries=0)
-    bot = Bot(token=TELEGRAM_BOT_TOKEN)
-    # No FSM global isolation: checkout must never queue behind a slow AI generation.
+    MAIN_BOT = Bot(token=TELEGRAM_BOT_TOKEN)
+    bots = [MAIN_BOT]
     dp = Dispatcher(disable_fsm=True)
-    dp.include_router(router)
+    dp.include_routers(router, pay_router)
     dp.errors.register(errors)
     task = asyncio.create_task(housekeeping())
     try:
-        await bot.delete_webhook(drop_pending_updates=False)
-        await bot.set_my_commands([
+        main_info = await MAIN_BOT.get_me()
+        MAIN_USERNAME = main_info.username or ""
+        PAYMENT_BOT, PAYMENT_USERNAME = await configure_payment_bot(MAIN_BOT)
+        if PAYMENT_BOT is not None:
+            bots.append(PAYMENT_BOT)
+        for merchant in bots:
+            await merchant.delete_webhook(drop_pending_updates=False)
+        await MAIN_BOT.set_my_commands([
             BotCommand(command="menu", description="🎛 Главное меню"),
             BotCommand(command="pro", description="⭐ Pro · 7 дней за 5 Stars"),
             BotCommand(command="role", description="👤 Моя роль"),
@@ -736,14 +869,21 @@ async def main():
             BotCommand(command="paysupport", description="🛟 Помощь с платежом"),
             BotCommand(command="privacy", description="🔒 О данных"),
         ])
-        await bot.set_chat_menu_button(menu_button=MenuButtonCommands())
-        logging.warning("Gosha v4 started; roles Free/Pro/Owner enabled; payments=%s", payments_ready())
-        await dp.start_polling(bot, allowed_updates=["message", "callback_query", "pre_checkout_query"])
+        await MAIN_BOT.set_chat_menu_button(menu_button=MenuButtonCommands())
+        if PAYMENT_BOT:
+            await PAYMENT_BOT.set_my_commands([
+                BotCommand(command="start", description="⭐ Открыть оплату"),
+                BotCommand(command="terms", description="📜 Условия"),
+                BotCommand(command="paysupport", description="🛟 Помощь с покупкой"),
+            ])
+        logging.warning("Gosha v5 started; bots=%s payments=%s owner_has_no_quota=True", len(bots), payments_ready())
+        await dp.start_polling(*bots, allowed_updates=["message", "callback_query", "pre_checkout_query"])
     finally:
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
         await client.close()
-        await bot.session.close()
+        for merchant in bots:
+            await merchant.session.close()
 
 
 if __name__ == "__main__":
