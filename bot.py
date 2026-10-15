@@ -1147,7 +1147,22 @@ async def configure_payment_bot(main_bot):
     return None, ""
 
 
+BOT_DESCRIPTION = "Анфиса — ИИ-подруга с характером. Общение, юмор и дерзость. 16+."
+
+
+async def update_bot_description(merchant):
+    for language in ("", "ru"):
+        for action, field in (("set_my_description", "description"),
+                              ("set_my_short_description", "short_description")):
+            try:
+                await getattr(merchant, action)(**{field: BOT_DESCRIPTION}, language_code=language, request_timeout=10)
+            except TelegramAPIError:
+                logging.warning("Bot description update deferred: %s", action)
+
+
 async def apply_brand(merchant, payment=False):
+    if not payment:
+        await update_bot_description(merchant)
     name = "Анфиса · Оплата" if payment else "Анфиса"
     try:
         await merchant.set_my_name(name=name)
