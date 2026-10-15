@@ -1,13 +1,14 @@
-"""Local accounting for one-time 5 XTR purchases of 7 days of Pro.
+"""Local accounting for one-time Telegram Stars purchases of 7 days of Pro.
 No Telegram calls here. All grants and quotas are transaction-safe.
 """
 import sqlite3
 import time
 from contextlib import closing
 
-PRICE = 5
+PRICE = 1  # Temporary offer. New orders capture this price; old invoices keep theirs.
 DURATION = 7 * 24 * 60 * 60
-FREE_LIMIT = 10
+FREE_LIMIT = 20
+GOSHA_BONUS = 5
 WINDOW = 60 * 60
 ORDER_TTL = 30 * 60
 
@@ -49,11 +50,15 @@ def init(path):
         CREATE TABLE IF NOT EXISTS rate_limits (
             user_id INTEGER PRIMARY KEY, last_ts REAL NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS permanent_bonuses (
+            user_id INTEGER PRIMARY KEY, gosha_claimed_at REAL NOT NULL
+        );
         ''')
         # Existing v3/v4 databases keep their purchases and access. Merchant 0 means legacy main bot.
         for table, column, declaration in [
             ('pro_orders', 'merchant_id', 'INTEGER NOT NULL DEFAULT 0'),
             ('pro_orders', 'kind', "TEXT NOT NULL DEFAULT 'invoice'"),
+            ('pro_orders', 'price', 'INTEGER NOT NULL DEFAULT 5'),
             ('pro_charges', 'merchant_id', 'INTEGER NOT NULL DEFAULT 0'),
             ('pro_refunds', 'merchant_id', 'INTEGER NOT NULL DEFAULT 0'),
         ]:
@@ -81,20 +86,28 @@ def recompute(con, uid):
 
 def snapshot(con, uid, now):
     until = pro_until(con, uid)
+    claimed = con.execute('SELECT 1 FROM permanent_bonuses WHERE user_id=?', (uid,)).fetchone()
+    bonus = GOSHA_BONUS if claimed else 0
+    limit = FREE_LIMIT + bonus
     row = con.execute('SELECT COUNT(*),MIN(at_ts) FROM hour_usage WHERE user_id=? AND at_ts>?',
                       (uid, now - WINDOW)).fetchone()
     return {'pro': until > now, 'until': until, 'used': row[0],
-            'remaining': max(0, FREE_LIMIT - row[0]),
+            'remaining': max(0, limit - row[0]), 'limit': limit, 'bonus': bonus,
             'next_slot': row[1] + WINDOW if row[1] is not None else now}
 
 
 def run(path, action, uid=0, value=None, now=None):
     now = time.time() if now is None else float(now)
     with closing(connect(path)) as con, con:
-        if action in ('reserve', 'payment', 'refund', 'precheck'):
+        if action in ('reserve', 'payment', 'refund', 'precheck', 'gosha_bonus'):
             con.execute('BEGIN IMMEDIATE')
         if action == 'status':
             return snapshot(con, uid, now)
+        if action == 'gosha_bonus':
+            # Unique Telegram user ID + write transaction: one permanent grant, even concurrently.
+            claimed = con.execute('INSERT OR IGNORE INTO permanent_bonuses(user_id,gosha_claimed_at) VALUES(?,?)',
+                                  (uid, now)).rowcount == 1
+            return {'granted': claimed, **snapshot(con, uid, now)}
         if action == 'reserve':
             cooldown = float(value.get('cooldown', 0)) if isinstance(value, dict) else float(value or 0)
             exempt = bool(value.get('bypass_quota', False)) if isinstance(value, dict) else False
@@ -103,7 +116,7 @@ def run(path, action, uid=0, value=None, now=None):
             if rate and now - rate[0] < cooldown:
                 return {'ok': False, 'reason': 'cooldown'}
             if not exempt and not state['pro'] and state['remaining'] == 0:
-                return {'ok': False, 'reason': 'quota', 'next_slot': state['next_slot']}
+                return {'ok': False, 'reason': 'quota', 'next_slot': state['next_slot'], 'limit': state['limit'], 'used': state['used']}
             con.execute('INSERT INTO rate_limits VALUES(?,?) ON CONFLICT(user_id) DO UPDATE SET last_ts=excluded.last_ts', (uid, now))
             reservation = None
             if not exempt and not state['pro']:
@@ -115,8 +128,8 @@ def run(path, action, uid=0, value=None, now=None):
             return
         if action == 'create_order':
             item = value if isinstance(value, dict) else {'payload': value}
-            con.execute('INSERT INTO pro_orders(payload,user_id,created,merchant_id,kind) VALUES(?,?,?,?,?)',
-                        (item['payload'], uid, now, int(item.get('merchant_id', 0)), item.get('kind', 'invoice')))
+            con.execute('INSERT INTO pro_orders(payload,user_id,created,merchant_id,kind,price) VALUES(?,?,?,?,?,?)',
+                        (item['payload'], uid, now, int(item.get('merchant_id', 0)), item.get('kind', 'invoice'), PRICE))
             return item['payload']
         if action == 'order':
             row = con.execute('SELECT * FROM pro_orders WHERE payload=? AND user_id=?', (value, uid)).fetchone()
@@ -129,7 +142,7 @@ def run(path, action, uid=0, value=None, now=None):
             valid = bool(order and order['user_id'] == uid and order['state'] in ('new', 'checkout')
                          and order['kind'] == 'invoice' and merchant_matches(order['merchant_id'], merchant, legacy_main)
                          and order['accepted_terms'] == 1 and now - order['created'] <= ORDER_TTL
-                         and amount == PRICE and currency == 'XTR')
+                         and amount == order['price'] and order['price'] == PRICE and currency == 'XTR')
             if valid:
                 con.execute("UPDATE pro_orders SET state='checkout' WHERE payload=?", (payload,))
             return valid
@@ -143,7 +156,7 @@ def run(path, action, uid=0, value=None, now=None):
             order = con.execute('SELECT * FROM pro_orders WHERE payload=?', (payload,)).fetchone()
             valid = bool(order and order['user_id'] == uid and order['state'] == 'checkout'
                          and order['kind'] == 'invoice' and merchant_matches(order['merchant_id'], merchant, legacy_main)
-                         and order['accepted_terms'] == 1 and amount == PRICE and currency == 'XTR')
+                         and order['accepted_terms'] == 1 and amount == order['price'] and currency == 'XTR')
             refund = con.execute('SELECT user_id,merchant_id FROM pro_refunds WHERE charge_id=?', (charge,)).fetchone()
             refund = refund if refund and merchant_matches(refund['merchant_id'], merchant, legacy_main) else None
             state = 'refunded' if refund else ('granted' if valid else 'orphan')
