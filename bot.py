@@ -335,7 +335,7 @@ def menu_keyboard(mode="hard", pro=False):
     return InlineKeyboardMarkup(inline_keyboard=[
         [button(("✓ " if key == mode else "") + label, "mode:" + key)
          for key, label in MODE_NAMES.items()],
-        [button("⭐ Мой Pro · продлить" if pro else "⭐ Pro · 7 дней за 5 звёзд", "ui:pro")],
+        [button("⭐ Мой Pro · продлить" if pro else f"⭐ Pro · 7 дней за {billing.PRICE} ⭐", "ui:pro")],
         [button("❔ Как общаться", "ui:help"), button("🔒 О данных", "ui:privacy")],
     ])
 
@@ -360,20 +360,21 @@ PRIVACY = (
     "Локально: Telegram ID, согласие, режим и последние 24 сообщения. "
     "Тексты старше 30 дней очищаются ежечасно.\n"
     "Для квоты сохраняются отметки бесплатных запросов за последний час. "
+    "Для постоянного бонуса — Telegram ID и дата получения; это не история переписки. "
     "Для Pro — заказы, подтверждения платежей, сроки доступа и возвраты. "
     "Финансовый журнал не удаляется автоматически командой /delete.\n\n"
     "/reset — стереть переписку. /delete — также настройки и согласие. "
-    "Активный оплаченный доступ, записи платежей и временные антиспам-счётчики сохраняются. "
+    "Активный оплаченный доступ, записи платежей, постоянный бонус к квоте и временные антиспам-счётчики сохраняются. "
     "Старый дневной счётчик предыдущей версии очищается после смены дня UTC.\n\n"
     "Это не удаляет копии у Telegram и провайдеров. Самоподтверждение 16+ не заменяет "
     "проверку документов. По данным и платежам: /support текст или /paysupport текст."
 )
 TERMS = (
     "<b>📜 Условия Pro</b>\n\n"
-    "⭐ Цена: <b>5 Telegram Stars</b>.\n"
+    f"⭐ Цена: <b>{billing.PRICE} ⭐</b> (Telegram Stars).\n"
     "🗓 Срок: <b>7 × 24 часа</b> после подтверждения оплаты. "
     "Повторная покупка добавляет 7 дней к действующему сроку.\n"
-    "∞ На этот срок снимается бесплатная квота 10 запросов/час. "
+    f"∞ На этот срок снимается бесплатная квота {billing.FREE_LIMIT} запросов/час (с постоянным бонусом — {billing.FREE_LIMIT + billing.GOSHA_BONUS}). "
     f"Пауза {COOLDOWN} с, ограничения длины и защита от перегрузки остаются.\n"
     "🔁 Разовый платёж, <b>без автопродления</b>.\n\n"
     "Оплачивается доступ к ИИ-боту, а не гарантированная формулировка каждого ответа. "
@@ -391,9 +392,9 @@ HELP = (
     "😌 Мягко — спокойно и без мата.\n🔥 Жёстко — ругань и личные подколы.\n"
     "💀 Без фильтров — самая грубая добровольная перепалка. "
     "При реальном кризисе — поддержка, не добивание.\n\n"
-    "🆓 Бесплатно: 10 успешных ответов за скользящие 60 минут. "
+    f"🆓 Бесплатно: {billing.FREE_LIMIT} успешных ответов за скользящие 60 минут; с постоянным бонусом — {billing.FREE_LIMIT + billing.GOSHA_BONUS}. "
     "Освободившийся запрос возвращается через час после его использования.\n"
-    "⭐ Pro: 5 звёзд → 7 дней без почасовой квоты. Оплата — в отдельном боте.\n👑 Owner — без квоты и паузы между запросами.\n\n"
+    f"⭐ Pro: {billing.PRICE} ⭐ → 7 дней без почасовой квоты. Оплата — в отдельном боте.\n👑 Owner — без квоты и паузы между запросами.\n\n"
     "/menu — меню · /pro — доступ · /role — роль\n/soft · /hard · /raw — режимы\n"
     "/reset — забыть диалог · /delete — удалить данные\n"
     "/terms — условия · /privacy — данные\n/paysupport текст — помощь с оплатой\n"
@@ -430,10 +431,11 @@ async def show_menu(message, uid, edit=False):
         if OWNER_ID > 0 and uid == OWNER_ID:
             quota = "∞ <b>Owner: без квоты и паузы между запросами</b>"
         else:
-            quota = f"⭐ <b>Pro до {utc_date(state['until'])}</b>" if state['pro'] else f"🆓 <b>{state['remaining']}/10</b> запросов за последний час"
+            quota = f"⭐ <b>Pro до {utc_date(state['until'])}</b>" if state['pro'] else f"🆓 <b>{state['remaining']}/{state['limit']}</b> запросов за последний час"
+        bonus_line = f"\n🎁 Постоянный бонус: +{state['bonus']} к бесплатному лимиту" if state['bonus'] else ""
         caption = (
             "<b>АНФИСА · коротко и в лицо</b>\n\n"
-            f"{role_line(uid, state)}\n🎛 Твой режим: <b>{MODE_NAMES[mode]}</b>\n{quota}\n\n"
+            f"{role_line(uid, state)}\n🎛 Твой режим: <b>{MODE_NAMES[mode]}</b>\n{quota}{bonus_line}\n\n"
             "Пиши прямо в чат. Меньше церемоний — больше дела."
         )
         kb = menu_keyboard(mode, state['pro'])
@@ -472,7 +474,7 @@ async def show_pro(message, uid):
         current = "\n👑 <b>У Owner уже нет квоты и паузы. Покупка для себя не требуется.</b>\n"
     text = (
         "<b>⭐ АНФИСА PRO</b>\n" + role_line(uid, state) + "\n\n"
-        "∞ Без почасовой квоты\n🗓 7 дней доступа\n💫 Всего 5 Telegram Stars\n"
+        f"∞ Без почасовой квоты\n🗓 7 дней доступа\n💫 Всего {billing.PRICE} ⭐ (Telegram Stars)\n"
         "🔁 Без автосписаний\n" + current +
         f"\nПауза {COOLDOWN} с и защита от перегрузки остаются для обычного Pro. "
         "Повторная покупка продлевает срок на 7 дней.\n\n"
@@ -483,7 +485,7 @@ async def show_pro(message, uid):
     if payments_ready():
         payload = "gl_" + secrets.token_urlsafe(24)
         await bill("create_order", uid, {'payload': payload, 'merchant_id': PAYMENT_BOT.id, 'kind': 'link'})
-        rows.append([InlineKeyboardButton(text="Оплатить ⭐ 5", url=f"https://t.me/{PAYMENT_USERNAME}?start={payload}")])
+        rows.append([InlineKeyboardButton(text=f"Оплатить ⭐ {billing.PRICE}", url=f"https://t.me/{PAYMENT_USERNAME}?start={payload}")])
     else:
         if OWNER_ID > 0 and uid == OWNER_ID:
             text += "\n\n⚙️ Есть ошибка настройки оплаты. Нажми кнопку диагностики ниже."
@@ -550,7 +552,8 @@ async def payment_refunded(message: Message):
     payer = charge['user_id'] if charge else message.from_user.id
     until = await bill("refund", payer, (refund.telegram_payment_charge_id, message.bot.id,
                                         MAIN_BOT.id if MAIN_BOT else 0))
-    suffix = f"Pro остаётся до {utc_date(until)}." if until > time.time() else "Доступны бесплатные 10 запросов/час."
+    state = await bill("status", payer)
+    suffix = f"Pro остаётся до {utc_date(until)}." if until > time.time() else f"Доступны бесплатные {state['limit']} запросов/час."
     await message.answer("Возврат учтён. " + suffix)
 
 
@@ -601,7 +604,7 @@ async def clear_handler(message: Message):
     await store(action, message.from_user.id)
     text = "🧹 Переписка забыта. Режим и лимит не изменились."
     if action == "delete":
-        text = "Переписка, настройки и согласие удалены. Оплаченный срок, платёжный журнал и временные счётчики сохраняются. Подробнее: /privacy."
+        text = "Переписка, настройки и согласие удалены. Оплаченный срок, платёжный журнал, постоянный бонус и временные счётчики сохраняются. Подробнее: /privacy."
     await message.answer(text, reply_markup=back_keyboard())
 
 
@@ -667,7 +670,7 @@ async def owner_handler(message: Message):
         await message.answer("Последние платежи:\n\n" + ("\n\n".join(lines) or "Пока нет."), parse_mode=None)
     elif command == "refund":
         if len(parts) < 2:
-            await message.answer("/refund CHARGE_ID — полный возврат 5 Stars. Для несопоставленного платежа: /refund CHARGE_ID TELEGRAM_ID")
+            await message.answer("/refund CHARGE_ID — полный возврат суммы конкретного платежа. Для несопоставленного платежа: /refund CHARGE_ID TELEGRAM_ID")
             return
         charge = await bill("charge", value=parts[1])
         uid = charge['user_id'] if charge else (int(parts[2]) if len(parts) == 3 and parts[2].isdigit() else None)
@@ -722,12 +725,12 @@ async def create_invoice(message, uid, link_payload=None):
     try:
         await message.bot.send_invoice(
             chat_id=uid, title="Анфиса Pro · 7 дней",
-            description=f"7 дней доступа без почасовой квоты в @{MAIN_USERNAME}. Всего 5 Stars, без автосписаний. Защита от спама остаётся.",
+            description=f"7 дней доступа без почасовой квоты в @{MAIN_USERNAME}. Всего {billing.PRICE} ⭐, без автосписаний. Защита от спама остаётся.",
             payload=invoice_payload, provider_token="", currency="XTR",
             prices=[LabeledPrice(label="Pro · 7 дней", amount=billing.PRICE)],
             start_parameter="anfisa-pro",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="Заплатить ⭐ 5", pay=True)],
+                [InlineKeyboardButton(text=f"Заплатить ⭐ {billing.PRICE}", pay=True)],
                 [InlineKeyboardButton(text="Прочитать условия", url=f"https://t.me/{MAIN_USERNAME}?start=terms")]
             ]),
         )
@@ -742,7 +745,7 @@ async def payment_start(message: Message):
     if payload.startswith("gl_") and len(payload) <= 64:
         await create_invoice(message, message.from_user.id, payload)
     else:
-        await message.answer("⭐ Оплата Анфиса Pro: 7 дней за 5 Telegram Stars. Открой Pro в основном боте и нажми «Оплатить» — сюда передастся твой заказ.", reply_markup=main_bot_keyboard(pro=True))
+        await message.answer(f"⭐ Оплата Анфиса Pro: 7 дней за {billing.PRICE} ⭐. Открой Pro в основном боте и нажми «Оплатить» — сюда передастся твой заказ.", reply_markup=main_bot_keyboard(pro=True))
 
 
 async def payment_help(message: Message):
@@ -770,7 +773,7 @@ async def generate(message, uid, text):
         if not permit['ok']:
             if permit['reason'] == 'quota':
                 minutes = max(1, math.ceil((permit['next_slot'] - time.time()) / 60))
-                await message.answer(f"🆓 10/10 за последний час. Следующий запрос примерно через {minutes} мин.\n⭐ Pro: 7 дней без этой квоты за 5 звёзд.",
+                await message.answer(f"🆓 {permit['used']}/{permit['limit']} за последний час. Следующий запрос примерно через {minutes} мин.\n⭐ Pro: 7 дней без этой квоты за {billing.PRICE} ⭐.",
                                      reply_markup=InlineKeyboardMarkup(inline_keyboard=[[button("⭐ Посмотреть Pro", "ui:pro")]]))
             else:
                 await message.answer(f"Пауза между запросами — {COOLDOWN} с.")
@@ -820,9 +823,19 @@ GOSHA_CAPTION = (
 
 @router.message(F.text.regexp(GOSHA_TRIGGER))
 async def gosha_easter_egg(message: Message):
-    # No consent, Owner or Pro gate, generation request, or quota reservation.
+    # Public easter egg: no consent, Owner/Pro gate, generation or request charge.
     if GOSHA_PHOTO.is_file():
         await message.answer_photo(FSInputFile(GOSHA_PHOTO), caption=GOSHA_CAPTION, parse_mode=None)
+        result = await bill("gosha_bonus", message.from_user.id)
+        if result['granted']:
+            await message.answer(
+                f"🎁 Пасхалка найдена! +{billing.GOSHA_BONUS} запросов в час навсегда.\n"
+                f"Твой бесплатный лимит теперь — {result['limit']} запросов/час. "
+                "У Pro и Owner почасовой квоты по-прежнему нет.", parse_mode=None)
+        else:
+            await message.answer(
+                f"🎁 Бонус уже твой: бесплатный лимит — {result['limit']} запросов/час. "
+                "Повторно он не складывается.", parse_mode=None)
     else:
         await message.answer("Гоша ушёл за картинкой. Скоро вернётся 🗿", parse_mode=None)
 
@@ -998,7 +1011,7 @@ async def main():
             await apply_brand(merchant, payment=PAYMENT_BOT is not None and merchant.id == PAYMENT_BOT.id)
         await MAIN_BOT.set_my_commands([
             BotCommand(command="menu", description="🎛 Главное меню"),
-            BotCommand(command="pro", description="⭐ Pro · 7 дней за 5 Stars"),
+            BotCommand(command="pro", description=f"⭐ Pro · 7 дней за {billing.PRICE} ⭐"),
             BotCommand(command="role", description="👤 Моя роль"),
             BotCommand(command="hard", description="🔥 Жёстко"),
             BotCommand(command="soft", description="😌 Без мата"),
