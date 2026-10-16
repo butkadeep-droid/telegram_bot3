@@ -408,7 +408,7 @@ WELCOME = (
     "<b>АНФИСА · коротко и в лицо</b>\n\n"
     "😌 Мягко — без мата и личных оскорблений.\n"
     "💀 Без фильтров — самая резкая словесная перепалка.\n"
-    "🧠 Умный — задачи и объяснения · только Plus и Owner.\n\n"
+    "🧠 Умный — задачи и объяснения · Plus, 5 ответов/час.\n\n"
     "<b>16+</b> · Это ИИ-персонаж. Продолжая, соглашаешься на выбранный "
     "стиль и обработку сообщений: текст передаётся OpenRouter и провайдеру.\n"
     "Не хочешь ругани — сразу выбирай «Мягко»."
@@ -430,7 +430,7 @@ TERMS = (
     "Повторная покупка добавляет 7 дней к действующему сроку.\n"
     f"∞ На этот срок снимается бесплатная квота {billing.FREE_LIMIT} запросов/час (с постоянным бонусом — {billing.FREE_LIMIT + billing.GOSHA_BONUS}). "
     f"Пауза {COOLDOWN} с, ограничения длины и защита от перегрузки остаются.\n"
-    "🧠 На время Plus открывается режим «Умный» с отдельной моделью.\n"
+    "🧠 На время Plus открывается режим «Умный» с отдельной моделью: 5 успешных ответов за скользящие 60 минут. Ошибки генерации не списываются.\n"
     "🔁 Разовый платёж, <b>без автопродления</b>.\n\n"
     "Оплачивается доступ к ИИ-боту, а не гарантированная формулировка каждого ответа. "
     "Сервисы Telegram и модели могут быть временно недоступны. "
@@ -447,11 +447,11 @@ HELP = (
     "😌 Мягко — спокойно и без мата.\n"
     "💀 Без фильтров — самая грубая добровольная перепалка. "
     "При реальном кризисе — поддержка, не добивание.\n"
-    "🧠 Умный — решает текстовые задачи и объясняет; только действующий Plus и Owner.\n\n"
+    "🧠 Умный — решает текстовые задачи и объясняет; только действующий Plus, 5 успешных ответов/час.\n\n"
     f"🆓 Бесплатно: {billing.FREE_LIMIT} успешных ответов за скользящие 60 минут; с постоянным бонусом — {billing.FREE_LIMIT + billing.GOSHA_BONUS}. "
     "Освободившийся запрос возвращается через час после его использования.\n"
-    f"💠 Plus: {billing.PRICE} ⭐ → 7 дней без почасовой квоты. Оплата — в отдельном боте.\n👑 Owner — без квоты и паузы между запросами.\n\n"
-    "/menu — меню · /plus — доступ · /role — роль\n/soft · /smart · /raw — режимы\n/smart — Умный · Plus и Owner\n"
+    f"💠 Plus: {billing.PRICE} ⭐ → 7 дней без почасовой квоты в обычных режимах; «Умный» — 5 ответов/час. Оплата — в отдельном боте.\n👑 Owner — без квоты и паузы между запросами.\n\n"
+    "/menu — меню · /plus — доступ · /role — роль\n/soft · /smart · /raw — режимы\n/smart — Умный · Plus\n"
     "/reset — забыть диалог · /delete — удалить данные\n"
     "/terms — условия · /privacy — данные\n/paysupport текст — помощь с оплатой\n"
     f"Обычные режимы — до {OUTPUT_CHARS} символов; «Умный» — до {SMART_OUTPUT_CHARS}. "
@@ -493,6 +493,8 @@ async def show_menu(message, uid, edit=False):
             quota = "∞ <b>Owner: без квоты и паузы между запросами</b>"
         else:
             quota = f"⭐ <b>Plus до {utc_date(state['until'])}</b>" if state['pro'] else f"🆓 <b>{state['remaining']}/{state['limit']}</b> запросов за последний час"
+        if mode == "smart" and not (OWNER_ID > 0 and uid == OWNER_ID):
+            quota += f"\n🧠 Умный: <b>{state['smart_remaining']}/{billing.SMART_LIMIT}</b> осталось за скользящий час"
         bonus_line = f"\n🎁 Постоянный бонус: +{state['bonus']} к бесплатному лимиту" if state['bonus'] else ""
         caption = (
             "<b>АНФИСА · коротко и в лицо</b>\n\n"
@@ -535,7 +537,7 @@ async def show_pro(message, uid):
         current = "\n👑 <b>У Owner уже нет квоты и паузы. Покупка для себя не требуется.</b>\n"
     text = (
         "<b>💠 АНФИСА PLUS</b>\n" + role_line(uid, state) + "\n\n"
-        f"∞ Без почасовой квоты\n🧠 Доступ к режиму «Умный»\n🗓 7 дней доступа\n💫 Всего {billing.PRICE} ⭐ (Telegram Stars)\n"
+        f"∞ Обычные режимы — без почасовой квоты\n🧠 Умный — {billing.SMART_LIMIT} ответов/час\n🗓 7 дней доступа\n💫 Всего {billing.PRICE} ⭐ (Telegram Stars)\n"
         "🔁 Без автосписаний\n" + current +
         f"\nПауза {COOLDOWN} с и защита от перегрузки остаются для обычного Plus. "
         "Повторная покупка продлевает срок на 7 дней.\n\n"
@@ -595,7 +597,7 @@ async def payment_received(message: Message):
     if result['state'] == 'duplicate':
         return
     if result['state'] == 'granted':
-        await message.answer(f"💠 Plus включён до {utc_date(result['until'])}.\nПочасовая квота снята. Пиши.", reply_markup=main_bot_keyboard())
+        await message.answer(f"💠 Plus включён до {utc_date(result['until'])}.\nВ обычных режимах почасовая квота снята. Умный — 5 ответов/час. Пиши.", reply_markup=main_bot_keyboard())
         await notify_owner(message.bot, f"Оплата Plus: {payment.total_amount} Stars. Пользователь {message.from_user.id}.\nCharge: {payment.telegram_payment_charge_id}")
     elif result['state'] == 'orphan':
         await message.answer("Оплата получена, но не сопоставлена с заказом. Напиши /paysupport — владелец проверит платёж или оформит возврат.")
@@ -660,7 +662,9 @@ async def mode_handler(message: Message):
         await smart_paywall(message)
         return
     await store("mode", uid, mode)
-    await message.answer(f"{MODE_NAMES[mode]} — включён.", reply_markup=menu_keyboard(mode, state['pro'], uid))
+    detail = (f"\nДоступно {state['smart_remaining']}/{billing.SMART_LIMIT} ответов за скользящий час."
+              if mode == "smart" and not (OWNER_ID > 0 and uid == OWNER_ID) else "")
+    await message.answer(f"{MODE_NAMES[mode]} — включён.{detail}", reply_markup=menu_keyboard(mode, state['pro'], uid))
 
 
 @router.message(Command("reset", "delete"))
@@ -790,7 +794,7 @@ async def create_invoice(message, uid, link_payload=None):
     try:
         await message.bot.send_invoice(
             chat_id=uid, title="Анфиса Plus · 7 дней",
-            description=f"7 дней доступа без почасовой квоты в @{MAIN_USERNAME}. Всего {billing.PRICE} ⭐, без автосписаний. Защита от спама остаётся.",
+            description=f"7 дней Plus в @{MAIN_USERNAME}: обычные режимы без почасовой квоты, Умный — 5 ответов/час. Всего {billing.PRICE} ⭐, без автосписаний. Защита от спама остаётся.",
             payload=invoice_payload, provider_token="", currency="XTR",
             prices=[LabeledPrice(label="Plus · 7 дней", amount=billing.PRICE)],
             start_parameter="anfisa-plus",
@@ -818,7 +822,7 @@ async def payment_help(message: Message):
 
 
 async def smart_paywall(message):
-    await message.answer("🔒 Режим «Умный» доступен только Plus и Owner.\nОткрой Plus, чтобы включить его.",
+    await message.answer("🔒 Режим «Умный» доступен только Plus.\nЛимит — 5 успешных ответов за скользящий час.\nОткрой Plus, чтобы включить его.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[button("💠 Посмотреть Plus", "ui:pro")]]))
 
 
@@ -875,11 +879,15 @@ async def generate(message, uid, text):
     try:
         is_owner = OWNER_ID > 0 and uid == OWNER_ID
         permit = await bill("reserve", uid, {'cooldown': 0 if is_owner else COOLDOWN,
-                                             'bypass_quota': is_owner, 'require_pro': is_smart and not is_owner})
+                                             'bypass_quota': is_owner, 'require_pro': is_smart and not is_owner, 'smart': is_smart})
         if not permit['ok']:
             if permit['reason'] == 'pro_required':
                 await store("mode", uid, "soft")
                 await smart_paywall(message)
+            elif permit['reason'] == 'smart_quota':
+                minutes = max(1, math.ceil((permit['next_slot'] - time.time()) / 60))
+                await message.answer(f"🧠 Лимит «Умного»: {billing.SMART_LIMIT} ответов за час.\nСледующий запрос примерно через {minutes} мин.\nМожно переключиться на «Мягко» или «Без фильтров».",
+                                     reply_markup=menu_keyboard(mode, True, uid))
             elif permit['reason'] == 'quota':
                 minutes = max(1, math.ceil((permit['next_slot'] - time.time()) / 60))
                 await message.answer(f"🆓 {permit['used']}/{permit['limit']} за последний час. Следующий запрос примерно через {minutes} мин.\n💠 Plus: 7 дней без этой квоты за {billing.PRICE} ⭐.",
@@ -1290,7 +1298,7 @@ def backup_before_price_restore():
     if not folder.resolve().is_relative_to(Path(VOLUME_PATH).resolve()):
         raise RuntimeError("Backup directory must stay inside Railway Volume")
     folder.mkdir(parents=True, exist_ok=True, mode=0o700)
-    target = folder / (source.name + ".before-owner-menu-v10.sqlite3")
+    target = folder / (source.name + ".before-smart-quota-v11.sqlite3")
 
     def verify(path):
         if path.is_symlink():
@@ -1363,7 +1371,7 @@ async def main():
             BotCommand(command="role", description="👤 Моя роль"),
             BotCommand(command="soft", description="😌 Без мата"),
             BotCommand(command="raw", description="💀 Без фильтров"),
-            BotCommand(command="smart", description="🧠 Умный · Plus и Owner"),
+            BotCommand(command="smart", description="🧠 Умный · Plus"),
             BotCommand(command="help", description="❔ Как общаться"),
             BotCommand(command="terms", description="📜 Условия Plus"),
             BotCommand(command="paysupport", description="🛟 Помощь с платежом"),

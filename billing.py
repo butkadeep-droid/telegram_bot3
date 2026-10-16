@@ -8,6 +8,7 @@ from contextlib import closing
 PRICE = 5  # Regular price restored. Already confirmed orders keep their recorded price.
 DURATION = 7 * 24 * 60 * 60
 FREE_LIMIT = 20
+SMART_LIMIT = 5
 GOSHA_BONUS = 5
 GIFT_DURATION = 24 * 60 * 60
 GIFT_TTL = 10 * 60
@@ -49,6 +50,10 @@ def init(path):
             user_id INTEGER NOT NULL, at_ts REAL NOT NULL
         );
         CREATE INDEX IF NOT EXISTS hour_usage_user ON hour_usage(user_id, at_ts);
+        CREATE TABLE IF NOT EXISTS smart_hour_usage (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, at_ts REAL NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS smart_hour_usage_user ON smart_hour_usage(user_id, at_ts);
         CREATE TABLE IF NOT EXISTS rate_limits (
             user_id INTEGER PRIMARY KEY, last_ts REAL NOT NULL
         );
@@ -103,7 +108,12 @@ def snapshot(con, uid, now):
     limit = FREE_LIMIT + bonus
     row = con.execute('SELECT COUNT(*),MIN(at_ts) FROM hour_usage WHERE user_id=? AND at_ts>?',
                       (uid, now - WINDOW)).fetchone()
-    return {'pro': until > now, 'until': until, 'used': row[0],
+    smart = con.execute('SELECT COUNT(*),MIN(at_ts) FROM smart_hour_usage WHERE user_id=? AND at_ts>?',
+                        (uid, now - WINDOW)).fetchone()
+    return {'smart_used': smart[0], 'smart_limit': SMART_LIMIT,
+            'smart_remaining': max(0, SMART_LIMIT - smart[0]),
+            'smart_next_slot': smart[1] + WINDOW if smart[1] is not None else now,
+            'pro': until > now, 'until': until, 'used': row[0],
             'remaining': max(0, limit - row[0]), 'limit': limit, 'bonus': bonus,
             'next_slot': row[1] + WINDOW if row[1] is not None else now}
 
@@ -141,10 +151,14 @@ def run(path, action, uid=0, value=None, now=None):
         if action == 'reserve':
             cooldown = float(value.get('cooldown', 0)) if isinstance(value, dict) else float(value or 0)
             exempt = bool(value.get('bypass_quota', False)) if isinstance(value, dict) else False
+            smart_mode = isinstance(value, dict) and bool(value.get('smart') or value.get('require_pro'))
             state = snapshot(con, uid, now)
             # Authorize smart generation inside the same transaction as its reservation.
             if isinstance(value, dict) and value.get('require_pro') and not exempt and not state['pro']:
                 return {'ok': False, 'reason': 'pro_required'}
+            if smart_mode and not exempt and state['smart_remaining'] == 0:
+                return {'ok': False, 'reason': 'smart_quota', 'limit': SMART_LIMIT,
+                        'used': state['smart_used'], 'next_slot': state['smart_next_slot']}
             rate = con.execute('SELECT last_ts FROM rate_limits WHERE user_id=?', (uid,)).fetchone()
             if rate and now - rate[0] < cooldown:
                 return {'ok': False, 'reason': 'cooldown'}
@@ -152,11 +166,16 @@ def run(path, action, uid=0, value=None, now=None):
                 return {'ok': False, 'reason': 'quota', 'next_slot': state['next_slot'], 'limit': state['limit'], 'used': state['used']}
             con.execute('INSERT INTO rate_limits VALUES(?,?) ON CONFLICT(user_id) DO UPDATE SET last_ts=excluded.last_ts', (uid, now))
             reservation = None
-            if not exempt and not state['pro']:
+            if smart_mode and not exempt:
+                row_id = con.execute('INSERT INTO smart_hour_usage(user_id,at_ts) VALUES(?,?)', (uid, now)).lastrowid
+                reservation = {'scope': 'smart', 'id': row_id}
+            elif not exempt and not state['pro']:
                 reservation = con.execute('INSERT INTO hour_usage(user_id,at_ts) VALUES(?,?)', (uid, now)).lastrowid
             return {'ok': True, 'reservation': reservation}
         if action == 'release':
-            if value is not None:
+            if isinstance(value, dict) and value.get('scope') == 'smart':
+                con.execute('DELETE FROM smart_hour_usage WHERE id=? AND user_id=?', (value['id'], uid))
+            elif value is not None:
                 con.execute('DELETE FROM hour_usage WHERE id=? AND user_id=?', (value, uid))
             return
         if action == 'create_order':
@@ -217,6 +236,7 @@ def run(path, action, uid=0, value=None, now=None):
             return [dict(row) for row in con.execute('SELECT * FROM pro_charges ORDER BY paid_at DESC LIMIT 10')]
         if action == 'cleanup':
             con.execute('DELETE FROM hour_usage WHERE at_ts<=?', (now - WINDOW,))
+            con.execute('DELETE FROM smart_hour_usage WHERE at_ts<=?', (now - WINDOW,))
             con.execute('DELETE FROM rate_limits WHERE last_ts<=?', (now - WINDOW,))
             con.execute('DELETE FROM pro_gifts WHERE granted_at IS NULL AND created<?', (now - 86400,))
             # Unpaid checkout state is not erased: delayed valid payments must remain matchable.
