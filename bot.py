@@ -50,7 +50,7 @@ PAYMENT_BOT_TOKEN = os.getenv("PAYMENT_BOT_TOKEN", "").strip()
 # на файл в подключённом постоянном диске хостинга.
 DB = Path(os.getenv("DB_PATH", "data/gosha.sqlite3"))
 MODEL = os.getenv("MODEL", "deepseek/deepseek-chat")
-# Same OpenRouter key; only the Plus/Owner smart mode uses this model.
+# Same OpenRouter key; only the Плюс/Owner smart mode uses this model.
 SMART_MODEL = os.getenv("SMART_MODEL", "google/gemini-3.1-flash-lite").strip() or "google/gemini-3.1-flash-lite"
 SMART_INPUT_CHARS = 8000
 SMART_OUTPUT_CHARS = 6000
@@ -382,7 +382,7 @@ def payment_status_text():
 
 async def show_payment_status(message, uid):
     if OWNER_ID <= 0 or uid != OWNER_ID:
-        await message.answer("Диагностика доступна только Owner. Если это ты, проверь свой ID через /myid и значение OWNER_ID в Railway.")
+        await message.answer("Диагностика доступна только владельцу. Если это ты, проверь свой ID через /myid и значение OWNER_ID в Railway.")
         return
     await message.answer(payment_status_text(), parse_mode="HTML", reply_markup=back_keyboard())
 
@@ -390,13 +390,13 @@ async def show_payment_status(message, uid):
 def role_name(uid, state):
     if OWNER_ID > 0 and uid == OWNER_ID:
         return "Owner"
-    return "Plus" if state.get('pro') else "Бесплатная"
+    return "Плюс" if state.get('pro') else "Бесплатная"
 
 
 def role_line(uid, state):
     role = role_name(uid, state)
-    icon = {"Owner": "👑", "Plus": "💠", "Бесплатная": "🆓"}[role]
-    return f"{icon} Роль: <b>{role}</b>"
+    icon = {"Owner": "👑", "Плюс": "💠", "Бесплатная": "🆓"}[role]
+    return f"{icon} Роль: <b>{'Владелец' if role == 'Owner' else role}</b>"
 
 
 def utc_date(ts):
@@ -419,14 +419,14 @@ def smart_allowed(uid, state):
 
 
 def menu_keyboard(mode="soft", pro=False, uid=None):
-    labels = {"soft": "☁ Chill", "smart": "✦ Smart", "raw": "⚡ Raw"}
-    rows = [[button(("● " if key == mode else "") + labels[key] +
+    labels = {"soft": "Мягко", "smart": "Умный", "raw": "Без фильтров"}
+    rows = [[button(("✓ " if key == mode else "") + labels[key] +
                     (" 🔒" if key == "smart" and not smart_allowed(uid, {"pro": pro}) else ""),
-                    "mode:" + key, style="primary" if key == mode else None)
+                    "mode:" + key)
              for key in ("soft", "smart", "raw")]]
     if mode == "smart":
-        rows.append([button("🎨 Create image", "ui:image")])
-    rows.append([button("✦ My Plus · renew" if pro else f"✦ GOSHA PLUS · {billing.PRICE} ⭐ / 7 days", "ui:pro", style="success")])
+        rows.append([button("Создать картинку", "ui:image")])
+    rows.append([button("✦ Моя подписка · продлить" if pro else f"✦ Плюс · {billing.PRICE} ⭐ на 7 дней", "ui:pro")])
     if OWNER_ID > 0 and uid == OWNER_ID:
         rows.append([button("🛠 Меню бота", "admin:users:0")])
     rows.append([button("❔ Как общаться", "ui:help"), button("🔒 О данных", "ui:privacy")])
@@ -444,7 +444,7 @@ WELCOME = (
     "<b>ГОША · коротко и в лицо</b>\n\n"
     "😌 Мягко — без мата и личных оскорблений.\n"
     "💀 Без фильтров — самая резкая словесная перепалка.\n"
-    "🧠 Smart — задачи, фото и картинки · Plus, 5 запросов/час.\n\n"
+    "🧠 Умный — задачи, фото и картинки · Плюс, 5 запросов/час.\n\n"
     "<b>16+</b> · Это ИИ-персонаж. Продолжая, соглашаешься на выбранный "
     "стиль и обработку сообщений: текст передаётся OpenRouter и провайдеру.\n"
     "Не хочешь ругани — сразу выбирай «Мягко»."
@@ -461,13 +461,13 @@ PRIVACY_DETAILS = (
     "проверку документов. По данным и платежам: кнопка «Поддержка» или /support. Обращения и вложения получает владелец; они не отправляются ИИ. Для создания картинки описание также передаётся OpenRouter и модели; изображение в базе не сохраняется. В базе сохраняются только номера обращений и маршруты ответов до 30 дней; копии переписки остаются в Telegram."
 )
 TERMS = (
-    "<b>📜 Условия Plus</b>\n\n"
+    "<b>📜 Условия Плюс</b>\n\n"
     f"⭐ Цена: <b>{billing.PRICE} ⭐</b> (Telegram Stars).\n"
     "🗓 Срок: <b>7 × 24 часа</b> после подтверждения оплаты. "
     "Повторная покупка добавляет 7 дней к действующему сроку.\n"
     f"∞ На этот срок снимается бесплатная квота {billing.FREE_LIMIT} запросов/час. "
     f"Пауза {COOLDOWN} с, ограничения длины и защита от перегрузки остаются.\n"
-    "🧠 На время Plus открывается режим «Умный» с отдельной моделью: 5 успешных ответов за скользящие 60 минут. Ошибки генерации не списываются. Создание одной картинки по тексту использует один запрос из этого же лимита.\n"
+    "🧠 На время Плюс открывается режим «Умный» с отдельной моделью: 5 успешных ответов за скользящие 60 минут. Ошибки генерации не списываются. Создание одной картинки по тексту использует один запрос из этого же лимита.\n"
     "🔁 Разовый платёж, <b>без автопродления</b>.\n\n"
     "Оплачивается доступ к ИИ-боту, а не гарантированная формулировка каждого ответа. "
     "Сервисы Telegram и модели могут быть временно недоступны. "
@@ -484,11 +484,11 @@ HELP_DETAILS = (
     "😌 Мягко — спокойно и без мата.\n"
     "💀 Без фильтров — самая грубая добровольная перепалка. "
     "При реальном кризисе — поддержка, не добивание.\n"
-    "🧠 Умный — решает текстовые задачи и объясняет; только действующий Plus, 5 успешных ответов/час.\n\n"
+    "🧠 Умный — решает текстовые задачи и объясняет; только действующий Плюс, 5 успешных ответов/час.\n\n"
     f"🆓 Бесплатно: {billing.FREE_LIMIT} успешных ответов за скользящие 60 минут. "
     "Освободившийся запрос возвращается через час после его использования.\n"
-    f"💠 Plus: {billing.PRICE} ⭐ → 7 дней без почасовой квоты в обычных режимах; «Умный» — 5 ответов/час. Оплата — в отдельном боте.\n\n"
-    "/menu — меню · /plus — доступ · /role — роль\n/soft · /smart · /raw — режимы\n/smart — Умный · Plus\n"
+    f"💠 Плюс: {billing.PRICE} ⭐ → 7 дней без почасовой квоты в обычных режимах; «Умный» — 5 ответов/час. Оплата — в отдельном боте.\n\n"
+    "/menu — меню · /plus — доступ · /role — роль\n/soft · /smart · /raw — режимы\n/smart — Умный · Плюс\n"
     "/reset — забыть диалог · /delete — удалить данные\n"
     "/terms — условия · /privacy — данные\n/paysupport текст — помощь с оплатой\n"
     f"Обычные режимы — до {OUTPUT_CHARS} символов; «Умный» — до {SMART_OUTPUT_CHARS}. "
@@ -497,7 +497,7 @@ HELP_DETAILS = (
     "Один разбор фото — один запрос из лимита 5/час. Фото до 10 МБ. "
     "Не обрезай условие и рисунок; плохо читаемые места Гоша попросит уточнить. "
     "Для повторного просмотра деталей отправь фото снова.\n"
-    "\n🎨 В Smart напиши «Нарисуй …» или /image и описание. Готовая картинка — один запрос из общего лимита 5/час. Редактирование фото не подключено.\n"
+    "\n🎨 В Умный напиши «Нарисуй …» или /image и описание. Готовая картинка — один запрос из общего лимита 5/час. Редактирование фото не подключено.\n"
     f"Пауза между запросами: {COOLDOWN} с."
 )
 
@@ -515,10 +515,10 @@ HELP = (
     "Просто напиши Гоше — команды не нужны.\n\n"
     "😌 <b>Мягко</b> — спокойно, без мата.\n"
     "💀 <b>Без фильтров</b> — добровольная резкая перепалка.\n"
-    "✦ <b>Smart</b> — задачи, фото, объяснения и создание картинок; Plus, 5 запросов/час.\n\n"
+    "✦ <b>Умный</b> — задачи, фото, объяснения и создание картинок; Плюс, 5 запросов/час.\n\n"
     f"Бесплатно — {billing.FREE_LIMIT} ответов за скользящий час.\n"
     "Фото задачи отправляй в «Умном»: чётко, целиком, до 10 МБ.\n"
-    "🎨 Для картинки напиши в Smart: «Нарисуй …». Одна картинка — один запрос.\n"
+    "🎨 Для картинки напиши в Умный: «Нарисуй …». Одна картинка — один запрос.\n"
     "/reset — начать диалог заново. Если что-то не работает — жми «Поддержка»."
 )
 
@@ -577,9 +577,9 @@ async def show_menu(message, uid, edit=False):
         mode = "soft"
     if agreed:
         if OWNER_ID > 0 and uid == OWNER_ID:
-            quota = "∞ <b>Owner: без квоты и паузы между запросами</b>"
+            quota = "∞ <b>Владелец: без квоты и паузы между запросами</b>"
         else:
-            quota = f"⭐ <b>Plus до {utc_date(state['until'])}</b>" if state['pro'] else f"🆓 <b>{state['remaining']}/{state['limit']}</b> запросов за последний час"
+            quota = f"⭐ <b>Плюс до {utc_date(state['until'])}</b>" if state['pro'] else f"🆓 <b>{state['remaining']}/{state['limit']}</b> запросов за последний час"
         if mode == "smart" and not (OWNER_ID > 0 and uid == OWNER_ID):
             quota += f"\n🧠 Умный: <b>{state['smart_remaining']}/{billing.SMART_LIMIT}</b> осталось за скользящий час"
         bonus_line = f"\n🎁 Постоянный бонус: +{state['bonus']} к бесплатному лимиту" if state['bonus'] else ""
@@ -618,9 +618,9 @@ async def remove_navigation_screen(message, uid):
     if any(getattr(message, field, None) for field in ("invoice", "successful_payment", "refunded_payment")):
         return False
     body = (getattr(message, "text", None) or getattr(message, "caption", None) or "").lstrip()
-    if body.startswith(("✉ TICKET #", "✉ SUPPORT · #", "🛟 Ответ поддержки")):
+    if body.startswith(("✉ TICKET #", "✉ SUPPORT · #", "🛟 Ответ поддержки", "✉ ОБРАЩЕНИЕ №", "✉ ПОДДЕРЖКА · №")):
         return False
-    if getattr(message, "photo", None) and body.startswith("🎨 GOSHA STUDIO"):
+    if getattr(message, "photo", None) and body.startswith(("🎨 МАСТЕРСКАЯ ГОШИ", "🎨 GOSHA STUDIO")):
         return False
     try:
         await message.delete()
@@ -642,7 +642,7 @@ async def return_home(message, uid):
     await support_service.call("clear", bid=message.bot.id, uid=uid)
     # Send first: if Telegram rejects the replacement, the old screen is retained.
     if PAYMENT_BOT is not None and message.bot.id == PAYMENT_BOT.id:
-        await message.answer("⭐ Оплата Гоша Plus. Для общения открой основного бота.",
+        await message.answer("⭐ Оплата Гоша Плюс. Для общения открой основного бота.",
                              reply_markup=main_bot_keyboard(pro=True))
     else:
         await show_menu(message, uid)
@@ -654,7 +654,7 @@ def main_bot_keyboard(pro=False):
         return back_keyboard()
     link = f"https://t.me/{MAIN_USERNAME}?start={'plus' if pro else 'paid'}"
     return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="← Открыть Plus в основном боте" if pro else "← Вернуться к Гоше", url=link)
+        InlineKeyboardButton(text="← Открыть Плюс в основном боте" if pro else "← Вернуться к Гоше", url=link)
     ]])
 
 
@@ -664,12 +664,12 @@ async def show_pro(message, uid):
     state = await bill("status", uid)
     current = f"\n✅ <b>Активен до {utc_date(state['until'])}</b>\n" if state['pro'] else ""
     if OWNER_ID > 0 and uid == OWNER_ID:
-        current = "\n👑 <b>У Owner уже нет квоты и паузы. Покупка для себя не требуется.</b>\n"
+        current = "\n👑 <b>У владельца уже нет квоты и паузы. Покупка для себя не требуется.</b>\n"
     text = (
-        "<b>💠 ГОША PLUS</b>\n" + role_line(uid, state) + "\n\n"
-        f"∞ Обычные режимы — без почасовой квоты\n✦ Smart — {billing.SMART_LIMIT} запросов/час, включая картинки\n🗓 7 дней доступа\n💫 Всего {billing.PRICE} ⭐ (Telegram Stars)\n"
+        "<b>💠 ГОША ПЛЮС</b>\n" + role_line(uid, state) + "\n\n"
+        f"∞ Обычные режимы — без почасовой квоты\n✦ Умный — {billing.SMART_LIMIT} запросов/час, включая картинки\n🗓 7 дней доступа\n💫 Всего {billing.PRICE} ⭐ (Telegram Stars)\n"
         "🔁 Без автосписаний\n" + current +
-        f"\nПауза {COOLDOWN} с и защита от перегрузки остаются для обычного Plus. "
+        f"\nПауза {COOLDOWN} с и защита от перегрузки остаются для обычного Плюс. "
         "Повторная покупка продлевает срок на 7 дней.\n\n"
         "Прочитай условия. Нажимая «Оплатить», принимаешь их. "
         "Оплата откроется в отдельном боте: нажми там «Старт» — появится счёт Telegram."
@@ -678,7 +678,7 @@ async def show_pro(message, uid):
     if payments_ready():
         payload = "gl_" + secrets.token_urlsafe(24)
         await bill("create_order", uid, {'payload': payload, 'merchant_id': PAYMENT_BOT.id, 'kind': 'link'})
-        rows.append([InlineKeyboardButton(text=f"✦ Оплатить Plus · {billing.PRICE} ⭐", style="success", url=f"https://t.me/{PAYMENT_USERNAME}?start={payload}")])
+        rows.append([InlineKeyboardButton(text=f"✦ Оплатить Плюс · {billing.PRICE} ⭐", url=f"https://t.me/{PAYMENT_USERNAME}?start={payload}")])
     else:
         if OWNER_ID > 0 and uid == OWNER_ID:
             text += "\n\n⚙️ Есть ошибка настройки оплаты. Нажми кнопку диагностики ниже."
@@ -714,7 +714,7 @@ async def checkout(query: PreCheckoutQuery):
     except Exception:
         logging.error("Checkout validation failed")
         ok = False
-    await query.answer(ok=ok, error_message=None if ok else "Счёт недоступен. Вернись в основной бот → Plus и нажми «Оплатить» заново, либо обратись в поддержку.")
+    await query.answer(ok=ok, error_message=None if ok else "Счёт недоступен. Вернись в основной бот → Плюс и нажми «Оплатить» заново, либо обратись в поддержку.")
 
 
 @router.message(F.successful_payment)
@@ -727,8 +727,8 @@ async def payment_received(message: Message):
     if result['state'] == 'duplicate':
         return
     if result['state'] == 'granted':
-        await message.answer(f"💠 Plus включён до {utc_date(result['until'])}.\nВ обычных режимах почасовая квота снята. Умный — 5 ответов/час. Пиши.", reply_markup=main_bot_keyboard())
-        await notify_owner(message.bot, f"Оплата Plus: {payment.total_amount} Stars. Пользователь {message.from_user.id}.\nCharge: {payment.telegram_payment_charge_id}")
+        await message.answer(f"💠 Плюс включён до {utc_date(result['until'])}.\nВ обычных режимах почасовая квота снята. Умный — 5 ответов/час. Пиши.", reply_markup=main_bot_keyboard())
+        await notify_owner(message.bot, f"Оплата Плюс: {payment.total_amount} Stars. Пользователь {message.from_user.id}.\nCharge: {payment.telegram_payment_charge_id}")
     elif result['state'] == 'orphan':
         await message.answer("Оплата получена, но не сопоставлена с заказом. Напиши /paysupport — владелец проверит платёж или оформит возврат.")
         await notify_owner(message.bot, f"Нужна проверка оплаты! User {message.from_user.id}; charge {payment.telegram_payment_charge_id}")
@@ -746,7 +746,7 @@ async def payment_refunded(message: Message):
     until = await bill("refund", payer, (refund.telegram_payment_charge_id, message.bot.id,
                                         MAIN_BOT.id if MAIN_BOT else 0))
     state = await bill("status", payer)
-    suffix = f"Plus остаётся до {utc_date(until)}." if until > time.time() else f"Доступны бесплатные {state['limit']} запросов/час."
+    suffix = f"Плюс остаётся до {utc_date(until)}." if until > time.time() else f"Доступны бесплатные {state['limit']} запросов/час."
     await message.answer("Возврат учтён. " + suffix)
 
 
@@ -891,7 +891,7 @@ async def owner_handler(message: Message):
             await message.answer(ERROR_MESSAGE)
             return
         await bill("refund", uid, (parts[1], merchant.id, MAIN_BOT.id if MAIN_BOT else 0))
-        await message.answer("Возврат выполнен, срок Plus пересчитан.")
+        await message.answer("Возврат выполнен, срок Плюс пересчитан.")
 
 
 async def create_invoice(message, uid, link_payload=None):
@@ -913,21 +913,21 @@ async def create_invoice(message, uid, link_payload=None):
                  and order['accepted_terms'] == 1 and time.time() - order['created'] <= billing.ORDER_TTL)
     agreed = await store("get", uid)
     if not valid or not agreed or not agreed[0]:
-        await message.answer("Ссылка устарела или предназначена другому пользователю. Открой Plus в основном боте и нажми «Оплатить» ещё раз.", reply_markup=main_bot_keyboard(pro=True))
+        await message.answer("Ссылка устарела или предназначена другому пользователю. Открой Плюс в основном боте и нажми «Оплатить» ещё раз.", reply_markup=main_bot_keyboard(pro=True))
         return
     # Each explicit Start creates a distinct invoice, not a reusable forwarded payment.
     invoice_payload = "gi_" + secrets.token_urlsafe(24)
     await bill("create_order", uid, {'payload': invoice_payload, 'merchant_id': PAYMENT_BOT.id, 'kind': 'invoice'})
     try:
         await message.bot.send_invoice(
-            chat_id=uid, title="Гоша Plus · 7 дней",
-            description=f"7 дней Plus в @{MAIN_USERNAME}: обычные режимы без почасовой квоты, Умный — 5 ответов/час. Всего {billing.PRICE} ⭐, без автосписаний. Защита от спама остаётся.",
+            chat_id=uid, title="Гоша Плюс · 7 дней",
+            description=f"7 дней Плюс в @{MAIN_USERNAME}: обычные режимы без почасовой квоты, Умный — 5 ответов/час. Всего {billing.PRICE} ⭐, без автосписаний. Защита от спама остаётся.",
             payload=invoice_payload, provider_token="", currency="XTR",
-            prices=[LabeledPrice(label="Plus · 7 дней", amount=billing.PRICE)],
+            prices=[LabeledPrice(label="Плюс · 7 дней", amount=billing.PRICE)],
             start_parameter="gosha-plus",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text=f"✦ Pay · {billing.PRICE} ⭐", pay=True, style="success")],
-                [InlineKeyboardButton(text="≡ Terms", url=f"https://t.me/{MAIN_USERNAME}?start=terms")]
+                [InlineKeyboardButton(text=f"Оплатить · {billing.PRICE} ⭐", pay=True)],
+                [InlineKeyboardButton(text="Условия подписки", url=f"https://t.me/{MAIN_USERNAME}?start=terms")]
             ]),
         )
     except TelegramAPIError:
@@ -941,7 +941,7 @@ async def payment_start(message: Message):
     if payload.startswith("gl_") and len(payload) <= 64:
         await create_invoice(message, message.from_user.id, payload)
     else:
-        await message.answer(f"⭐ Оплата Гоша Plus: 7 дней за {billing.PRICE} ⭐. Открой Plus в основном боте и нажми «Оплатить» — сюда передастся твой заказ.", reply_markup=main_bot_keyboard(pro=True))
+        await message.answer(f"⭐ Оплата Гоша Плюс: 7 дней за {billing.PRICE} ⭐. Открой Плюс в основном боте и нажми «Оплатить» — сюда передастся твой заказ.", reply_markup=main_bot_keyboard(pro=True))
 
 
 async def payment_help(message: Message):
@@ -949,8 +949,8 @@ async def payment_help(message: Message):
 
 
 async def smart_paywall(message):
-    await message.answer("🔒 Режим «Умный» доступен только Plus.\nЛимит — 5 успешных ответов за скользящий час.\nОткрой Plus, чтобы включить его.",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[button("💠 Посмотреть Plus", "ui:pro")]]))
+    await message.answer("🔒 Режим «Умный» доступен только Плюс.\nЛимит — 5 успешных ответов за скользящий час.\nОткрой Плюс, чтобы включить его.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[button("💠 Посмотреть Плюс", "ui:pro")]]))
 
 
 class LimitedPhotoBuffer(BytesIO):
@@ -998,14 +998,14 @@ def smart_reply(text, finish_reason=None):
 
 
 async def generate_picture(message, uid, prompt):
-    progress = await message.answer("🎨 GOSHA STUDIO\nСоздаю картинку по твоему описанию… Это может занять до трёх минут.")
+    progress = await message.answer("🎨 МАСТЕРСКАЯ ГОШИ\nСоздаю картинку по твоему описанию… Это может занять до трёх минут.")
     delivered = False
     try:
         raw, filename = await asyncio.wait_for(imagegen.create_image(prompt, OPENROUTER_API_KEY, IMAGE_MODEL),
                                                timeout=imagegen.TIMEOUT + 5)
         await message.bot.send_chat_action(message.chat.id, ChatAction.UPLOAD_PHOTO)
         await message.answer_photo(BufferedInputFile(raw, filename=filename),
-                                   caption="🎨 GOSHA STUDIO · готово", parse_mode=None)
+                                   caption="🎨 МАСТЕРСКАЯ ГОШИ · готово", parse_mode=None)
         delivered = True
         # Never persist raw generated image bytes or API response data.
         await store("save", uid, ("[Запрос картинки] " + prompt, "[Создана и отправлена картинка по запросу.]"))
@@ -1037,7 +1037,7 @@ async def image_prompt(message, uid):
         await smart_paywall(message)
         return
     await store("mode", uid, "smart")
-    await message.answer("🎨 GOSHA STUDIO\n\nНапиши: «Нарисуй …» и опиши, что хочешь увидеть.\nНапример: «Нарисуй кота-космонавта в стиле комикса».\n\nОдна готовая картинка = один запрос из общего лимита Smart (5/час). Пока доступно создание по тексту, без изменения фото.",
+    await message.answer("🎨 МАСТЕРСКАЯ ГОШИ\n\nНапиши: «Нарисуй …» и опиши, что хочешь увидеть.\nНапример: «Нарисуй кота-космонавта в стиле комикса».\n\nОдна готовая картинка = один запрос из общего лимита Умный (5/час). Пока доступно создание по тексту, без изменения фото.",
                          reply_markup=menu_keyboard("smart", state["pro"], uid))
 
 
@@ -1059,7 +1059,7 @@ async def generate(message, uid, text, photo=None, image_requested=False):
     is_smart = mode == "smart"
     want_image = image_requested or imagegen.is_image_request(text)
     if want_image and not is_smart:
-        await message.answer("🎨 Картинки создаются в Smart · Plus. Выбери «✦ Smart» и напиши, например: «Нарисуй кота-космонавта».",
+        await message.answer("🎨 Картинки создаются в Умный · Плюс. Выбери «✦ Умный» и напиши, например: «Нарисуй кота-космонавта».",
                              reply_markup=menu_keyboard(mode, (await bill("status", uid))["pro"], uid))
         return
     if want_image and photo is not None:
@@ -1105,8 +1105,8 @@ async def generate(message, uid, text, photo=None, image_requested=False):
                                      reply_markup=menu_keyboard(mode, True, uid))
             elif permit['reason'] == 'quota':
                 minutes = max(1, math.ceil((permit['next_slot'] - time.time()) / 60))
-                await message.answer(f"🆓 {permit['used']}/{permit['limit']} за последний час. Следующий запрос примерно через {minutes} мин.\n💠 Plus: 7 дней без этой квоты за {billing.PRICE} ⭐.",
-                                     reply_markup=InlineKeyboardMarkup(inline_keyboard=[[button("💠 Посмотреть Plus", "ui:pro")]]))
+                await message.answer(f"🆓 {permit['used']}/{permit['limit']} за последний час. Следующий запрос примерно через {minutes} мин.\n💠 Плюс: 7 дней без этой квоты за {billing.PRICE} ⭐.",
+                                     reply_markup=InlineKeyboardMarkup(inline_keyboard=[[button("💠 Посмотреть Плюс", "ui:pro")]]))
             else:
                 await message.answer(f"Пауза между запросами — {COOLDOWN} с.")
             return
@@ -1226,7 +1226,7 @@ def members_table(rows):
 
 async def show_bot_admin(message, uid, page=0, edit=False):
     if not owner_admin_allowed(message, uid):
-        await message.answer("⛔ Это меню доступно только Owner.")
+        await message.answer("⛔ Это меню доступно только владельцу.")
         return
     roster = await store("members", uid, page)
     page = roster['page']
@@ -1234,12 +1234,12 @@ async def show_bot_admin(message, uid, page=0, edit=False):
             f"👥 Пользователи: <b>{roster['total']}</b>\n\n" + members_table(roster['rows']) +
             f"\n\n📄 Страница {page + 1}/{roster['pages']}\n"
             "— = юзернейм не указан или пока неизвестен.\n"
-            "🎁 Справа от каждого пользователя ниже — подарок Plus на 24 часа.")
+            "🎁 Справа от каждого пользователя ниже — подарок Плюс на 24 часа.")
     rows = []
     for recipient_id, username in roster['rows']:
         label = ("@" + username) if username else "Без юзернейма"
         rows.append([InlineKeyboardButton(text=f"👤 {label} · {recipient_id}", url=f"tg://user?id={recipient_id}"),
-                     button("🎁 Plus на 1 день", f"admin:giftstart:{recipient_id}:{page}")])
+                     button("🎁 Плюс на 1 день", f"admin:giftstart:{recipient_id}:{page}")])
     nav = []
     if page > 0:
         nav.append(button("⬅️ Назад", f"admin:users:{page - 1}"))
@@ -1271,7 +1271,7 @@ def admin_page(text):
 async def admin_users_callback(query: CallbackQuery):
     uid = query.from_user.id
     if not owner_admin_allowed(query.message, uid):
-        await query.message.answer("⛔ Это меню доступно только Owner.")
+        await query.message.answer("⛔ Это меню доступно только владельцу.")
         return
     page = admin_page(query.data.rsplit(":", 1)[-1])
     if page is None:
@@ -1284,7 +1284,7 @@ async def admin_users_callback(query: CallbackQuery):
 async def admin_gift_start(query: CallbackQuery):
     owner = query.from_user.id
     if not owner_admin_allowed(query.message, owner):
-        await query.message.answer("⛔ Подарки может выдавать только Owner.")
+        await query.message.answer("⛔ Подарки может выдавать только владелец.")
         return
     parts = query.data.split(":")
     if len(parts) != 4 or not parts[2].isascii() or not parts[2].isdecimal() or len(parts[2]) > 19:
@@ -1303,8 +1303,8 @@ async def admin_gift_start(query: CallbackQuery):
     await bill("gift_prepare", owner, {"token": token, "recipient_id": recipient})
     username = "@" + member[1] if member[1] else "без юзернейма"
     state = await bill("status", recipient)
-    current = f"Текущий Plus до {utc_date(state['until'])}." if state['pro'] else "Сейчас активного Plus нет."
-    text = ("<b>🎁 Подарить Plus на 1 день?</b>\n\n"
+    current = f"Текущий Плюс до {utc_date(state['until'])}." if state['pro'] else "Сейчас активного Плюс нет."
+    text = ("<b>🎁 Подарить Плюс на 1 день?</b>\n\n"
             f"👤 {escape(username)}\n🆔 <code>{recipient}</code>\n\n"
             f"{current}\nДобавится 24 часа: к действующему сроку или с момента подтверждения.\n"
             "⭐ Звёзды не списываются. Подтверждение действует 10 минут.")
@@ -1319,7 +1319,7 @@ async def admin_gift_start(query: CallbackQuery):
 async def admin_gift_confirm(query: CallbackQuery):
     owner = query.from_user.id
     if not owner_admin_allowed(query.message, owner):
-        await query.message.answer("⛔ Подарки может выдавать только Owner.")
+        await query.message.answer("⛔ Подарки может выдавать только владелец.")
         return
     parts = query.data.split(":")
     if len(parts) != 4 or not re.fullmatch(r"[A-Za-z0-9_-]{16,40}", parts[2]):
@@ -1342,10 +1342,10 @@ async def admin_gift_confirm(query: CallbackQuery):
     delivered = True
     try:
         await query.message.bot.send_message(recipient,
-            f"🎁 Владелец подарил тебе Plus на 1 день!\nPlus активен до {expiry}.\nОткрыть меню: /menu", parse_mode=None)
+            f"🎁 Владелец подарил тебе Плюс на 1 день!\nПлюс активен до {expiry}.\nОткрыть меню: /menu", parse_mode=None)
     except TelegramAPIError:
         delivered = False
-    text = f"✅ Подарен 1 день Plus.\n🆔 {recipient}\n🗓 Plus до {expiry}."
+    text = f"✅ Подарен 1 день Плюс.\n🆔 {recipient}\n🗓 Плюс до {expiry}."
     if not delivered:
         text += "\nУведомление не доставлено, но доступ сохранён."
     await query.message.answer(text, reply_markup=keyboard)
@@ -1379,7 +1379,7 @@ async def ui_callback(query: CallbackQuery):
         elif action == "menu":
             await return_home(message, uid)
         else:
-            await message.answer("⭐ Оплата Гоша Plus. Для общения открой основного бота.", reply_markup=main_bot_keyboard(pro=True))
+            await message.answer("⭐ Оплата Гоша Плюс. Для общения открой основного бота.", reply_markup=main_bot_keyboard(pro=True))
         return
     if action == "agree":
         await store("agree", uid)
@@ -1419,7 +1419,7 @@ BONUS_RETIREMENT_TEXT = (
     "Гоша снова на связи 👋\n"
     "Пасхалка отключена, а полученный за неё бонус +5 запросов в час отменён.\n"
     "Бесплатный лимит теперь — 20 ответов за скользящий час.\n\n"
-    "Подписка Plus, история и остальные настройки не изменились.\n"
+    "Подписка Плюс, история и остальные настройки не изменились.\n"
     "Открыть обновлённое меню: /menu"
 )
 
@@ -1644,14 +1644,14 @@ async def main():
         tasks.append(asyncio.create_task(bonus_retirement_worker(MAIN_BOT)))
         await MAIN_BOT.set_my_commands([
             BotCommand(command="menu", description="🎛 Главное меню"),
-            BotCommand(command="plus", description=f"💠 Plus · 7 дней за {billing.PRICE} ⭐"),
+            BotCommand(command="plus", description=f"💠 Плюс · 7 дней за {billing.PRICE} ⭐"),
             BotCommand(command="role", description="👤 Моя роль"),
             BotCommand(command="soft", description="😌 Без мата"),
             BotCommand(command="raw", description="💀 Без фильтров"),
-            BotCommand(command="smart", description="🧠 Умный · Plus"),
-            BotCommand(command="image", description="🎨 Создать картинку · Smart"),
+            BotCommand(command="smart", description="🧠 Умный · Плюс"),
+            BotCommand(command="image", description="🎨 Создать картинку · Умный"),
             BotCommand(command="help", description="❔ Как общаться"),
-            BotCommand(command="terms", description="📜 Условия Plus"),
+            BotCommand(command="terms", description="📜 Условия Плюс"),
             BotCommand(command="support", description="🛟 Поддержка"),
             BotCommand(command="paysupport", description="🛟 Помощь с платежом"),
             BotCommand(command="privacy", description="🔒 О данных"),
@@ -1663,7 +1663,7 @@ async def main():
                 BotCommand(command="terms", description="📜 Условия"),
                 BotCommand(command="paysupport", description="🛟 Помощь с покупкой"),
             ])
-        logging.warning("Gosha v15 clean navigation started; bots=%s payments=%s owner_has_no_quota=True", len(bots), payments_ready())
+        logging.warning("Gosha v16 Russian neutral interface started; bots=%s payments=%s owner_has_no_quota=True", len(bots), payments_ready())
         if not payments_ready():
             logging.warning("Payment setup checks failed: %s", ", ".join(name for name, ok, _ in payment_checks() if not ok))
         await dp.start_polling(*bots, allowed_updates=["message", "callback_query", "pre_checkout_query"])

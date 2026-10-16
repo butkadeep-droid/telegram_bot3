@@ -13,7 +13,7 @@ from aiogram.enums import ChatType
 from aiogram.exceptions import TelegramAPIError
 from aiogram.types import Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, ReplyParameters
 
-TOPICS = {'pay': 'Оплата и Plus', 'data': 'Данные', 'bug': 'Ошибка бота', 'other': 'Другой вопрос'}
+TOPICS = {'pay': 'Оплата и Плюс', 'data': 'Данные', 'bug': 'Ошибка бота', 'other': 'Другой вопрос'}
 
 
 def keyboard(*rows):
@@ -165,11 +165,11 @@ class Support:
 
     def actions(self,tid,owner=False):
         if owner:
-            return keyboard([(f'↗ Reply · #{tid:04d}',f'sup:reply:{tid}'),
-                             ('✓ Resolve',f'sup:close:{tid}')],
-                            [('≡ Inbox','sup:list:0')])
-        return keyboard([('＋ Add details',f'sup:reply:{tid}'),('✓ Done',f'sup:close:{tid}')],
-                        [('← Back to Gosha','sup:exit')])
+            return keyboard([(f'Ответить · №{tid:04d}',f'sup:reply:{tid}'),
+                             ('✓ Закрыть',f'sup:close:{tid}')],
+                            [('Обращения','sup:list:0')])
+        return keyboard([('＋ Дополнить',f'sup:reply:{tid}'),('✓ Готово',f'sup:close:{tid}')],
+                        [('← К Гоше','sup:exit')])
 
     @staticmethod
     def chunks(text,limit=2800):
@@ -185,11 +185,11 @@ class Support:
     async def deliver(self,m,t,target,is_owner,override=None,is_new=False):
         tid=t['id'];kb=self.actions(tid,not is_owner)
         if is_owner:
-            header=f"<b>✉ SUPPORT · #{tid:04d}</b>\nОтвет по твоему обращению"
+            header=f"<b>✉ ПОДДЕРЖКА · №{tid:04d}</b>\nОтвет по твоему обращению"
         else:
             name=(getattr(m.from_user,'full_name','') or str(m.from_user.id))[:100]
-            state='NEW' if is_new else 'UPDATE'
-            header=(f"<b>✉ TICKET #{tid:04d} · {state}</b>\n"
+            state='Новое' if is_new else 'Дополнение'
+            header=(f"<b>✉ ОБРАЩЕНИЕ №{tid:04d} · {state}</b>\n"
                     f"<b>Тема:</b> {escape(TOPICS.get(t['topic'],'Вопрос'))}\n"
                     f"<b>От:</b> {escape(name)} · <code>{m.from_user.id}</code>")
         async def remember(sent):
@@ -236,7 +236,7 @@ class Support:
             if not t or uid not in (self.owner(),t['user_id']):
                 await m.answer('Обращение недоступно.');return
             if act=='view':
-                await m.answer(f"✉ TICKET #{t['id']:04d} · {TOPICS.get(t['topic'],'Вопрос')}\nПользователь: {t['user_id']}\n"+
+                await m.answer(f"✉ ОБРАЩЕНИЕ №{t['id']:04d} · {TOPICS.get(t['topic'],'Вопрос')}\nПользователь: {t['user_id']}\n"+
                                ('Открыто' if t['status']=='open' else 'Закрыто'),
                                reply_markup=self.actions(t['id'],uid==self.owner()) if t['status']=='open' else home())
             elif t['status']!='open':await m.answer('Обращение уже закрыто.',reply_markup=home())
@@ -246,10 +246,10 @@ class Support:
                 await self.call('link',bid=bid,uid=uid,mid=prompt.message_id,tid=t['id'])
             elif act=='close':
                 await self.call('close',bid=bid,tid=t['id'])
-                await m.answer(f"✓ RESOLVED · #{t['id']:04d}",reply_markup=keyboard([('≡ Inbox','sup:list:0')]) if uid==self.owner() else home())
+                await m.answer(f"✓ Закрыто · №{t['id']:04d}",reply_markup=keyboard([('Обращения','sup:list:0')]) if uid==self.owner() else home())
                 recipient=t['user_id'] if uid==self.owner() else self.owner()
                 if recipient!=uid:
-                    try:await m.bot.send_message(recipient,f"✓ RESOLVED · #{t['id']:04d}",reply_markup=keyboard([('≡ Inbox','sup:list:0')]) if recipient==self.owner() else home())
+                    try:await m.bot.send_message(recipient,f"✓ Закрыто · №{t['id']:04d}",reply_markup=keyboard([('Обращения','sup:list:0')]) if recipient==self.owner() else home())
                     except TelegramAPIError:pass
 
     async def consume(self,m,override=None):
@@ -293,10 +293,10 @@ class Support:
         await self.call('mark',bid=bid,uid=uid,mid=m.message_id,tid=tid)
         if is_owner:
             await self.call('clear',bid=bid,uid=uid)
-            await m.answer(f"✓ SENT · #{tid:04d}\nОтвет доставлен пользователю {t['user_id']}.",reply_markup=self.actions(tid,True))
+            await m.answer(f"✓ Ответ отправлен · №{tid:04d}\nОтвет доставлен пользователю {t['user_id']}.",reply_markup=self.actions(tid,True))
         else:
             await self.call('set',bid=bid,uid=uid,kind='ticket',target=tid)
-            ack=await m.answer(f'✓ Отправлено · #{tid:04d}\nОтвет придёт сюда. Можешь дописать детали или нажать Back to Gosha.',reply_markup=self.actions(tid))
+            ack=await m.answer(f'✓ Отправлено · #{tid:04d}\nОтвет придёт сюда. Можешь дописать детали или нажать «К Гоше».',reply_markup=self.actions(tid))
             await self.call('link',bid=bid,uid=uid,mid=ack.message_id,tid=tid)
         return True
 
