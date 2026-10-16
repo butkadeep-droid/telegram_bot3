@@ -363,6 +363,8 @@ def db_run(action, uid=0, value=None):
     day = datetime.now(timezone.utc).date().isoformat()
     now = time.time()
     with closing(sqlite3.connect(DB, timeout=10)) as con, con:
+        if action == "name_notice_stats":
+            return dict(con.execute("SELECT state,COUNT(*) FROM name_notice_v28 GROUP BY state").fetchall())
         if action == "name_notice_claim":
             con.execute("BEGIN IMMEDIATE")
             row = con.execute("SELECT user_id FROM name_notice_v28 WHERE state='pending' AND next_at<=? AND lease_until<=? ORDER BY user_id LIMIT 1", (now, now)).fetchone()
@@ -1712,19 +1714,17 @@ async def send_name_notice(merchant):
 
 
 async def name_notice_worker(merchant):
-    # Do not announce a rename that Telegram has not accepted yet.
-    while True:
-        try:
-            default = await merchant.get_my_name(request_timeout=10)
-            russian = await merchant.get_my_name(language_code="ru", request_timeout=10)
-            if default.name == russian.name == "Gosha AI":
-                break
-        except (TelegramAPIError, OSError, asyncio.TimeoutError):
-            pass
+    # Retry the rename itself, not merely a read of its unchanged old value.
+    while not await ensure_bot_name(merchant):
         await asyncio.sleep(30)
+    logging.warning("Name notice starting: %s", await store("name_notice_stats"))
+    was_working = True
     while True:
         try:
             worked = await send_name_notice(merchant)
+            if not worked and was_working:
+                logging.warning("Name notice queue status: %s", await store("name_notice_stats"))
+            was_working = worked
         except Exception as exc:
             logging.warning("Name notice queue deferred: type=%s", type(exc).__name__)
             worked = False
@@ -1809,15 +1809,65 @@ async def update_bot_description(merchant):
                 logging.warning("Bot description update deferred: %s", action)
 
 
+_NAME_RETRY_AT = {}
+
+
+def safe_telegram_reason(exc):
+    # Log the Telegram description only; never a request or credential object.
+    reason = str(getattr(exc, "message", "") or type(exc).__name__)
+    for secret in (TELEGRAM_BOT_TOKEN, PAYMENT_BOT_TOKEN, OPENROUTER_API_KEY):
+        if secret:
+            reason = reason.replace(secret, "[redacted]")
+    reason = re.sub(r"\b\d{5,}:[A-Za-z0-9_-]{15,}", "[redacted]", reason)
+    return reason.replace("\n", " ").replace("\r", " ")[:240]
+
+
+async def ensure_bot_name(merchant, payment=False):
+    bot_id = merchant.id
+    if time.monotonic() < _NAME_RETRY_AT.get(bot_id, 0):
+        return False
+    wanted = "Гоша · Оплата" if payment else "Gosha AI"
+    language = ""
+    operation = "getMyName"
+    try:
+        for language in ("", "ru"):
+            operation = "getMyName"
+            current = await merchant.get_my_name(language_code=language, request_timeout=10)
+            if current.name != wanted:
+                operation = "setMyName"
+                await merchant.set_my_name(name=wanted, language_code=language, request_timeout=10)
+                operation = "getMyName verification"
+                current = await merchant.get_my_name(language_code=language, request_timeout=10)
+                if current.name != wanted:
+                    _NAME_RETRY_AT[bot_id] = time.monotonic() + 60
+                    logging.warning("Bot name not confirmed: bot=%s language=%s retry_in=60", bot_id, language or 'default')
+                    return False
+    except TelegramRetryAfter as exc:
+        delay = max(1, exc.retry_after) + 1
+        _NAME_RETRY_AT[bot_id] = time.monotonic() + delay
+        logging.warning("Bot name retry: bot=%s operation=%s language=%s retry_in=%s reason=%s",
+                        bot_id, operation, language or 'default', delay, safe_telegram_reason(exc))
+        return False
+    except (TelegramAPIError, OSError, asyncio.TimeoutError) as exc:
+        delay = 600 if isinstance(exc, (TelegramBadRequest, TelegramForbiddenError, TelegramUnauthorizedError)) else 30
+        _NAME_RETRY_AT[bot_id] = time.monotonic() + delay
+        logging.warning("Bot name update failed: bot=%s operation=%s language=%s retry_in=%s type=%s reason=%s",
+                        bot_id, operation, language or 'default', delay, type(exc).__name__, safe_telegram_reason(exc))
+        return False
+    _NAME_RETRY_AT.pop(bot_id, None)
+    logging.warning("Bot name confirmed: bot=%s name=%s", bot_id, wanted)
+    return True
+
+
+async def payment_name_retry_worker(merchant):
+    while not await ensure_bot_name(merchant, payment=True):
+        await asyncio.sleep(30)
+
+
 async def apply_brand(merchant, payment=False):
     if not payment:
         await update_bot_description(merchant)
-    name = "Гоша · Оплата" if payment else "Gosha AI"
-    try:
-        await merchant.set_my_name(name=name)
-        await merchant.set_my_name(name=name, language_code="ru")
-    except TelegramAPIError:
-        logging.warning("Brand name update deferred")
+    await ensure_bot_name(merchant, payment=payment)
     if not AVATAR_PHOTO.is_file():
         return
     digest = hashlib.sha256(AVATAR_PHOTO.read_bytes()).hexdigest()
@@ -1917,6 +1967,8 @@ async def main():
             await apply_brand(merchant, payment=PAYMENT_BOT is not None and merchant.id == PAYMENT_BOT.id)
         tasks.append(asyncio.create_task(bonus_retirement_worker(MAIN_BOT)))
         tasks.append(asyncio.create_task(name_notice_worker(MAIN_BOT)))
+        if PAYMENT_BOT is not None:
+            tasks.append(asyncio.create_task(payment_name_retry_worker(PAYMENT_BOT)))
         await MAIN_BOT.set_my_commands([
             BotCommand(command="menu", description="🎛 Главное меню"),
             BotCommand(command="plus", description=f"💠 Плюс · 7 дней за {billing.PRICE} ⭐"),
@@ -1937,7 +1989,7 @@ async def main():
                 BotCommand(command="terms", description="📜 Условия"),
                 BotCommand(command="paysupport", description="🛟 Помощь с покупкой"),
             ])
-        logging.warning("Gosha v28 name update and one-time notice; bots=%s payments=%s owner_has_no_quota=True", len(bots), payments_ready())
+        logging.warning("Gosha v29 verified name retry and one-time notice; bots=%s payments=%s owner_has_no_quota=True", len(bots), payments_ready())
         if not payments_ready():
             logging.warning("Payment setup checks failed: %s", ", ".join(name for name, ok, _ in payment_checks() if not ok))
         await dp.start_polling(*bots, allowed_updates=["message", "callback_query", "pre_checkout_query"])
