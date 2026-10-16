@@ -2,6 +2,7 @@
 No Telegram calls here. All grants and quotas are transaction-safe.
 """
 import sqlite3
+import secrets
 import time
 from contextlib import closing
 
@@ -9,7 +10,7 @@ PRICE = 5  # Regular price restored. Already confirmed orders keep their recorde
 DURATION = 7 * 24 * 60 * 60
 FREE_LIMIT = 20
 SMART_LIMIT = 5
-GOSHA_BONUS = 5
+GOSHA_BONUS = 0  # Easter egg retired; legacy API cannot grant it again.
 GIFT_DURATION = 24 * 60 * 60
 GIFT_TTL = 10 * 60
 WINDOW = 60 * 60
@@ -63,10 +64,16 @@ def init(path):
             granted_at REAL
         );
         CREATE INDEX IF NOT EXISTS pro_gifts_user ON pro_gifts(user_id, granted_at);
+        CREATE TABLE IF NOT EXISTS bonus_retirement_notices (
+            user_id INTEGER PRIMARY KEY, created REAL NOT NULL,
+            state TEXT NOT NULL DEFAULT 'pending', next_attempt REAL NOT NULL DEFAULT 0,
+            attempts INTEGER NOT NULL DEFAULT 0, claim_token TEXT
+        );
         CREATE TABLE IF NOT EXISTS permanent_bonuses (
             user_id INTEGER PRIMARY KEY, gosha_claimed_at REAL NOT NULL
         );
         ''')
+        con.execute('BEGIN IMMEDIATE')
         # Existing v3/v4 databases keep their purchases and access. Merchant 0 means legacy main bot.
         for table, column, declaration in [
             ('pro_orders', 'merchant_id', 'INTEGER NOT NULL DEFAULT 0'),
@@ -78,6 +85,12 @@ def init(path):
             columns = {row['name'] for row in con.execute(f'PRAGMA table_info({table})')}
             if column not in columns:
                 con.execute(f'ALTER TABLE {table} ADD COLUMN {column} {declaration}')
+
+        # Atomically remember only prior recipients, then revoke their old bonus.
+        # INSERT OR IGNORE preserves delivery state over redeploys and restarts.
+        con.execute('INSERT OR IGNORE INTO bonus_retirement_notices(user_id,created) '
+                    'SELECT user_id,? FROM permanent_bonuses WHERE user_id>0', (time.time(),))
+        con.execute('DELETE FROM permanent_bonuses')
 
 
 def merchant_matches(stored, actual, legacy_main):
@@ -103,8 +116,7 @@ def recompute(con, uid):
 
 def snapshot(con, uid, now):
     until = pro_until(con, uid)
-    claimed = con.execute('SELECT 1 FROM permanent_bonuses WHERE user_id=?', (uid,)).fetchone()
-    bonus = GOSHA_BONUS if claimed else 0
+    bonus = 0  # Retired bonuses cannot affect quota, even if an old row reappears.
     limit = FREE_LIMIT + bonus
     row = con.execute('SELECT COUNT(*),MIN(at_ts) FROM hour_usage WHERE user_id=? AND at_ts>?',
                       (uid, now - WINDOW)).fetchone()
@@ -121,7 +133,7 @@ def snapshot(con, uid, now):
 def run(path, action, uid=0, value=None, now=None):
     now = time.time() if now is None else float(now)
     with closing(connect(path)) as con, con:
-        if action in ('reserve', 'payment', 'refund', 'precheck', 'gosha_bonus', 'gift_grant'):
+        if action in ('reserve', 'payment', 'refund', 'precheck', 'gosha_bonus', 'gift_grant', 'bonus_notice_claim', 'bonus_notice_finish'):
             con.execute('BEGIN IMMEDIATE')
         if action == 'gift_prepare':
             recipient = int(value['recipient_id'])
@@ -144,10 +156,26 @@ def run(path, action, uid=0, value=None, now=None):
         if action == 'status':
             return snapshot(con, uid, now)
         if action == 'gosha_bonus':
-            # Unique Telegram user ID + write transaction: one permanent grant, even concurrently.
-            claimed = con.execute('INSERT OR IGNORE INTO permanent_bonuses(user_id,gosha_claimed_at) VALUES(?,?)',
-                                  (uid, now)).rowcount == 1
-            return {'granted': claimed, **snapshot(con, uid, now)}
+            return {'granted': False, 'retired': True, **snapshot(con, uid, now)}
+        if action == 'bonus_notice_claim':
+            row = con.execute("SELECT user_id FROM bonus_retirement_notices "
+                              "WHERE state IN ('pending','sending') AND next_attempt<=? "
+                              "ORDER BY created,user_id LIMIT 1", (now,)).fetchone()
+            if row is None:
+                return None
+            token = secrets.token_hex(16)
+            con.execute("UPDATE bonus_retirement_notices SET state='sending',next_attempt=?, "
+                        "attempts=attempts+1,claim_token=? WHERE user_id=?", (now+300,token,row['user_id']))
+            return {'user_id': row['user_id'], 'token': token}
+        if action == 'bonus_notice_finish':
+            state = value['state']
+            if state not in ('sent','blocked','pending'):
+                raise ValueError('Invalid notification state')
+            delay = max(1, float(value.get('delay',300)))
+            con.execute("UPDATE bonus_retirement_notices SET state=?,next_attempt=? "
+                        "WHERE user_id=? AND state='sending' AND claim_token=?",
+                        (state, now+delay,uid,value['token']))
+            return
         if action == 'reserve':
             cooldown = float(value.get('cooldown', 0)) if isinstance(value, dict) else float(value or 0)
             exempt = bool(value.get('bypass_quota', False)) if isinstance(value, dict) else False
@@ -237,6 +265,7 @@ def run(path, action, uid=0, value=None, now=None):
         if action == 'cleanup':
             con.execute('DELETE FROM hour_usage WHERE at_ts<=?', (now - WINDOW,))
             con.execute('DELETE FROM smart_hour_usage WHERE at_ts<=?', (now - WINDOW,))
+            con.execute("DELETE FROM bonus_retirement_notices WHERE state IN ('sent','blocked') AND created<?", (now-90*86400,))
             con.execute('DELETE FROM rate_limits WHERE last_ts<=?', (now - WINDOW,))
             con.execute('DELETE FROM pro_gifts WHERE granted_at IS NULL AND created<?', (now - 86400,))
             # Unpaid checkout state is not erased: delayed valid payments must remain matchable.
