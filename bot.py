@@ -279,7 +279,7 @@ pay_router = Router(name="gosha-payments")
 pay_router.message.filter(F.chat.type == ChatType.PRIVATE, BotRoleFilter(payment=True))
 pay_router.pre_checkout_query.filter(BotRoleFilter(payment=True))
 pay_router.callback_query.filter(F.message.chat.type == ChatType.PRIVATE, BotRoleFilter(payment=True))
-support_service = Support(lambda: DB, lambda: OWNER_ID)
+support_service = Support(lambda: DB, lambda: OWNER_ID, on_home=lambda message, uid: return_home(message, uid))
 client = None
 in_flight = 0
 image_in_flight = 0
@@ -604,6 +604,49 @@ async def show_menu(message, uid, edit=False):
         await message.answer_photo(FSInputFile(WELCOME_PHOTO), caption=caption, parse_mode="HTML", reply_markup=kb)
     else:
         await message.answer(caption, parse_mode="HTML", reply_markup=kb)
+
+
+async def remove_navigation_screen(message, uid):
+    """Delete ONLY the clicked, bot-authored UI screen in this user's private chat.
+    Financial records, support correspondence and generated images are never removed.
+    """
+    author = getattr(message, "from_user", None)
+    if (message.chat.type != ChatType.PRIVATE or message.chat.id != uid
+            or author is None or not getattr(author, "is_bot", False)
+            or author.id != message.bot.id):
+        return False
+    if any(getattr(message, field, None) for field in ("invoice", "successful_payment", "refunded_payment")):
+        return False
+    body = (getattr(message, "text", None) or getattr(message, "caption", None) or "").lstrip()
+    if body.startswith(("✉ TICKET #", "✉ SUPPORT · #", "🛟 Ответ поддержки")):
+        return False
+    if getattr(message, "photo", None) and body.startswith("🎨 GOSHA STUDIO"):
+        return False
+    try:
+        await message.delete()
+        return True
+    except TelegramAPIError:
+        # Old messages may be outside Telegram's deletion window. Make the old
+        # screen inactive if possible, but never destroy the newly sent menu.
+        logging.warning("Old navigation screen could not be deleted")
+        try:
+            await message.edit_reply_markup(reply_markup=None)
+        except TelegramAPIError:
+            pass
+        return False
+
+
+async def return_home(message, uid):
+    if message.chat.type != ChatType.PRIVATE or message.chat.id != uid:
+        return
+    await support_service.call("clear", bid=message.bot.id, uid=uid)
+    # Send first: if Telegram rejects the replacement, the old screen is retained.
+    if PAYMENT_BOT is not None and message.bot.id == PAYMENT_BOT.id:
+        await message.answer("⭐ Оплата Гоша Plus. Для общения открой основного бота.",
+                             reply_markup=main_bot_keyboard(pro=True))
+    else:
+        await show_menu(message, uid)
+    await remove_navigation_screen(message, uid)
 
 
 def main_bot_keyboard(pro=False):
@@ -1333,6 +1376,8 @@ async def ui_callback(query: CallbackQuery):
             await show_info(message, action)
         elif action == "support":
             await support_service.open(message, uid)
+        elif action == "menu":
+            await return_home(message, uid)
         else:
             await message.answer("⭐ Оплата Гоша Plus. Для общения открой основного бота.", reply_markup=main_bot_keyboard(pro=True))
         return
@@ -1340,7 +1385,7 @@ async def ui_callback(query: CallbackQuery):
         await store("agree", uid)
         await show_menu(message, uid, edit=True)
     elif action == "menu":
-        await show_menu(message, uid)
+        await return_home(message, uid)
     elif action == "pro":
         await show_pro(message, uid)
     elif action == "image":
@@ -1618,7 +1663,7 @@ async def main():
                 BotCommand(command="terms", description="📜 Условия"),
                 BotCommand(command="paysupport", description="🛟 Помощь с покупкой"),
             ])
-        logging.warning("Gosha v14 studio started; bots=%s payments=%s owner_has_no_quota=True", len(bots), payments_ready())
+        logging.warning("Gosha v15 clean navigation started; bots=%s payments=%s owner_has_no_quota=True", len(bots), payments_ready())
         if not payments_ready():
             logging.warning("Payment setup checks failed: %s", ", ".join(name for name, ok, _ in payment_checks() if not ok))
         await dp.start_polling(*bots, allowed_updates=["message", "callback_query", "pre_checkout_query"])

@@ -27,8 +27,9 @@ def home():
 
 
 class Support:
-    def __init__(self, db, owner):
+    def __init__(self, db, owner, on_home=None):
         self.db, self.owner = db, owner
+        self.on_home = on_home
 
     def init(self):
         with closing(sqlite3.connect(self.db(), timeout=10)) as c, c:
@@ -223,7 +224,10 @@ class Support:
         p=(q.data or '').split(':');act=p[1]
         if act=='exit':
             await self.call('clear',bid=bid,uid=uid)
-            await m.answer('Режим ввода для поддержки выключен. Нажми «Главное меню», чтобы продолжить.',reply_markup=keyboard([('← Главное меню','ui:menu')]))
+            if self.on_home is not None:
+                await self.on_home(m,uid)
+            else:
+                await m.answer('Режим ввода для поддержки выключен. Нажми «Главное меню», чтобы продолжить.',reply_markup=keyboard([('← Главное меню','ui:menu')]))
         elif act=='home':await self.open(m,uid)
         elif act=='new' and len(p)==3 and p[2] in TOPICS:await self.compose(m,uid,p[2])
         elif act=='list' and len(p)==3 and p[2].isdigit():await self.listing(m,uid,int(p[2]))
