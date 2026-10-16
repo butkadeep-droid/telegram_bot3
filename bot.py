@@ -10,6 +10,7 @@ import math
 import hashlib
 from html import escape
 import billing
+from support import Support, SupportMiddleware
 import sqlite3
 import time
 from contextlib import closing
@@ -83,6 +84,8 @@ OUTPUT_CHARS = 220
 BASE_DIR = Path(__file__).resolve().parent
 WELCOME_PHOTO = BASE_DIR / "welcome.jpg"
 AVATAR_PHOTO = BASE_DIR / "avatar.jpg"
+PRIVACY_PHOTO = BASE_DIR / "privacy.jpg"
+HELP_PHOTO = BASE_DIR / "help.jpg"
 
 SYSTEM = """Ты — Гоша, вымышленный дерзкий ИИ-собеседник. По-русски, на «ты». Говори о себе в мужском роде.
 Не рассказывай анекдоты, истории, притчи и мотивационные лекции. Не начинай
@@ -184,6 +187,7 @@ def db_init():
                 if table in tables:
                     con.execute(f'INSERT OR IGNORE INTO bot_members(user_id) SELECT DISTINCT user_id FROM "{table}" WHERE user_id > 0')
             con.execute("INSERT OR IGNORE INTO bot_registry_state VALUES('legacy_import_v1','done')")
+    support_service.init()
 
 
 def db_run(action, uid=0, value=None):
@@ -270,6 +274,8 @@ router.pre_checkout_query.filter(BotRoleFilter())
 pay_router = Router(name="gosha-payments")
 pay_router.message.filter(F.chat.type == ChatType.PRIVATE, BotRoleFilter(payment=True))
 pay_router.pre_checkout_query.filter(BotRoleFilter(payment=True))
+pay_router.callback_query.filter(F.message.chat.type == ChatType.PRIVATE, BotRoleFilter(payment=True))
+support_service = Support(lambda: DB, lambda: OWNER_ID)
 client = None
 in_flight = 0
 ERROR_MESSAGE = "Сервера сдохли"
@@ -308,6 +314,12 @@ class UserLockMiddleware(BaseMiddleware):
 user_lock = UserLockMiddleware()
 router.message.outer_middleware(user_lock)
 router.callback_query.outer_middleware(user_lock)
+router.message.outer_middleware(SupportMiddleware(support_service))
+router.callback_query.outer_middleware(SupportMiddleware(support_service))
+pay_router.message.outer_middleware(user_lock)
+pay_router.callback_query.outer_middleware(user_lock)
+pay_router.message.outer_middleware(SupportMiddleware(support_service))
+pay_router.callback_query.outer_middleware(SupportMiddleware(support_service))
 
 
 async def bill(action, uid=0, value=None):
@@ -409,6 +421,9 @@ def menu_keyboard(mode="soft", pro=False, uid=None):
     if OWNER_ID > 0 and uid == OWNER_ID:
         rows.append([button("🛠 Меню бота", "admin:users:0")])
     rows.append([button("❔ Как общаться", "ui:help"), button("🔒 О данных", "ui:privacy")])
+    rows.append([button("🛟 Поддержка", "ui:support")])
+    if OWNER_ID > 0 and uid == OWNER_ID:
+        rows.append([button("📥 Обращения", "sup:list:0")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -425,7 +440,7 @@ WELCOME = (
     "стиль и обработку сообщений: текст передаётся OpenRouter и провайдеру.\n"
     "Не хочешь ругани — сразу выбирай «Мягко»."
 )
-PRIVACY = (
+PRIVACY_DETAILS = (
     "<b>🔒 О данных</b>\n\n"
     "Текущий текст, присланное для разбора фото и до 24 прошлых сообщений передаются OpenRouter и провайдеру. "
     "Фото не сохраняются в локальной базе бота; сохраняются текст запроса и ответ. "
@@ -434,7 +449,7 @@ PRIVACY = (
     "Активный оплаченный доступ, записи платежей, временные антиспам-счётчики сохраняются. "
     "Старый дневной счётчик предыдущей версии очищается после смены дня UTC.\n\n"
     "Это не удаляет копии у Telegram и провайдеров. Самоподтверждение 16+ не заменяет "
-    "проверку документов. По данным и платежам: /support текст или /paysupport текст."
+    "проверку документов. По данным и платежам: кнопка «Поддержка» или /support. Обращения и вложения получает владелец; они не отправляются ИИ. В базе сохраняются только номера обращений и маршруты ответов до 30 дней; копии переписки остаются в Telegram."
 )
 TERMS = (
     "<b>📜 Условия Plus</b>\n\n"
@@ -454,7 +469,7 @@ TERMS = (
     "покупателя определяются применимым законодательством.\n\n"
     "Кнопка «Оплатить» в основном боте подтверждает принятие этих условий. Счёт выставляет отдельный платёжный бот этого же сервиса."
 )
-HELP = (
+HELP_DETAILS = (
     "<b>❔ Как общаться</b>\n\n"
     "Просто пиши. Гоша отвечает на твою реплику, не рассказывает анекдоты.\n"
     "😌 Мягко — спокойно и без мата.\n"
@@ -463,7 +478,7 @@ HELP = (
     "🧠 Умный — решает текстовые задачи и объясняет; только действующий Plus, 5 успешных ответов/час.\n\n"
     f"🆓 Бесплатно: {billing.FREE_LIMIT} успешных ответов за скользящие 60 минут. "
     "Освободившийся запрос возвращается через час после его использования.\n"
-    f"💠 Plus: {billing.PRICE} ⭐ → 7 дней без почасовой квоты в обычных режимах; «Умный» — 5 ответов/час. Оплата — в отдельном боте.\n👑 Owner — без квоты и паузы между запросами.\n\n"
+    f"💠 Plus: {billing.PRICE} ⭐ → 7 дней без почасовой квоты в обычных режимах; «Умный» — 5 ответов/час. Оплата — в отдельном боте.\n\n"
     "/menu — меню · /plus — доступ · /role — роль\n/soft · /smart · /raw — режимы\n/smart — Умный · Plus\n"
     "/reset — забыть диалог · /delete — удалить данные\n"
     "/terms — условия · /privacy — данные\n/paysupport текст — помощь с оплатой\n"
@@ -473,8 +488,51 @@ HELP = (
     "Один разбор фото — один запрос из лимита 5/час. Фото до 10 МБ. "
     "Не обрезай условие и рисунок; плохо читаемые места Гоша попросит уточнить. "
     "Для повторного просмотра деталей отправь фото снова.\n"
-    f"Пауза между запросами: {COOLDOWN} с (кроме Owner)."
+    f"Пауза между запросами: {COOLDOWN} с."
 )
+
+
+PRIVACY = (
+    "<b>🔒 О данных — коротко</b>\n\n"
+    "• Текст, фото задачи и до 24 прошлых сообщений передаются OpenRouter и провайдеру ИИ.\n"
+    "• Фото не хранятся в базе бота; текст и ответы сохраняются. Не присылай секреты.\n"
+    "• /reset — забыть диалог; /delete — удалить также настройки и согласие. Платежи, оплаченный доступ и временные счётчики сохраняются.\n"
+    "• Поддержку читает владелец, не ИИ. /delete удаляет номера обращений в базе, но не копии в Telegram и у провайдеров."
+)
+HELP = (
+    "<b>❔ Как общаться</b>\n\n"
+    "Просто напиши Гоше — команды не нужны.\n\n"
+    "😌 <b>Мягко</b> — спокойно, без мата.\n"
+    "💀 <b>Без фильтров</b> — добровольная резкая перепалка.\n"
+    "🧠 <b>Умный</b> — задачи, фото и объяснения; Plus, 5 ответов/час.\n\n"
+    f"Бесплатно — {billing.FREE_LIMIT} ответов за скользящий час.\n"
+    "Фото задачи отправляй в «Умном»: чётко, целиком, до 10 МБ.\n"
+    "/reset — начать диалог заново. Если что-то не работает — жми «Поддержка»."
+)
+
+
+def info_keyboard(action, detailed=False):
+    rows = []
+    if action in ("privacy", "help"):
+        rows.append([button("Коротко" if detailed else "Подробнее", "ui:"+action+("" if detailed else "_details"))])
+    rows += [[button("🛟 Поддержка", "ui:support")], [button("← Главное меню", "ui:menu")]]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def show_info(message, action):
+    detailed = action.endswith("_details")
+    key = action.removesuffix("_details")
+    text = {"privacy": PRIVACY_DETAILS if detailed else PRIVACY,
+            "help": HELP_DETAILS if detailed else HELP, "terms": TERMS}[key]
+    kb = info_keyboard(key, detailed)
+    photo = {"privacy": PRIVACY_PHOTO, "help": HELP_PHOTO}.get(key)
+    if not detailed and photo and photo.is_file():
+        try:
+            await message.answer_photo(FSInputFile(photo), caption=text, parse_mode="HTML", reply_markup=kb)
+            return
+        except TelegramAPIError:
+            logging.warning("Info image unavailable; using text: %s", key)
+    await message.answer(text, parse_mode="HTML", reply_markup=kb)
 
 
 def compact_reply(text):
@@ -664,8 +722,7 @@ async def pro_handler(message: Message):
 @router.message(Command("privacy", "terms", "help"))
 async def info_handler(message: Message):
     cmd = message.text.split()[0].split("@")[0][1:]
-    text = {"privacy": PRIVACY, "terms": TERMS, "help": HELP}[cmd]
-    await message.answer(text, parse_mode="HTML", reply_markup=back_keyboard())
+    await show_info(message, cmd)
 
 
 @router.message(Command("soft", "raw", "smart"))
@@ -688,6 +745,8 @@ async def mode_handler(message: Message):
 async def clear_handler(message: Message):
     action = message.text.split()[0].split("@")[0][1:]
     await store(action, message.from_user.id)
+    if action == "delete":
+        await support_service.call("purge", uid=message.from_user.id)
     text = "🧹 Переписка забыта. Режим и лимит не изменились."
     if action == "delete":
         text = "Переписка, настройки, согласие и запись в списке пользователей удалены. Оплаченный срок, платёжный журнал, временные счётчики сохраняются. Подробнее: /privacy."
@@ -712,19 +771,15 @@ async def myid_handler(message: Message):
 
 @router.message(Command("paysupport", "support"))
 async def support_handler(message: Message):
-    parts = message.text.split(maxsplit=1)
-    if len(parts) == 1:
-        await message.answer("Напиши /paysupport и опиши проблему в том же сообщении. Её получит владелец бота. Не отправляй пароли и ключи. Покупку обслуживает владелец, не поддержка Telegram.")
+    await support_service.command(message)
+
+
+@router.message(Command("tickets"))
+async def tickets_handler(message: Message):
+    if OWNER_ID <= 0 or message.from_user.id != OWNER_ID:
+        await message.answer("Эта команда только для владельца.")
         return
-    if OWNER_ID <= 0:
-        await message.answer("Владелец ещё не настроил поддержку. Новые оплаты отключены.")
-        return
-    try:
-        await message.bot.send_message(OWNER_ID, f"Обращение от {message.from_user.id}:\n{parts[1][:2600]}\n\nОтвет: /reply {message.from_user.id} ваш текст", parse_mode=None)
-    except TelegramAPIError:
-        await message.answer(ERROR_MESSAGE)
-        return
-    await message.answer("🛟 Отправлено владельцу. Ответ придёт сюда.")
+    await support_service.listing(message, message.from_user.id)
 
 
 @router.message(Command("reply", "stars", "payments", "refund"))
@@ -1187,6 +1242,14 @@ async def buy_callback(query: CallbackQuery):
 @router.callback_query(F.data.startswith("ui:"))
 async def ui_callback(query: CallbackQuery):
     action, message, uid = query.data.split(":", 1)[1], query.message, query.from_user.id
+    if PAYMENT_BOT is not None and message.bot.id == PAYMENT_BOT.id:
+        if action in ("privacy", "privacy_details", "help", "help_details", "terms"):
+            await show_info(message, action)
+        elif action == "support":
+            await support_service.open(message, uid)
+        else:
+            await message.answer("⭐ Оплата Гоша Plus. Для общения открой основного бота.", reply_markup=main_bot_keyboard(pro=True))
+        return
     if action == "agree":
         await store("agree", uid)
         await show_menu(message, uid, edit=True)
@@ -1194,12 +1257,12 @@ async def ui_callback(query: CallbackQuery):
         await show_menu(message, uid)
     elif action == "pro":
         await show_pro(message, uid)
-    elif action in ("privacy", "terms", "help"):
-        await message.answer({"privacy": PRIVACY, "terms": TERMS, "help": HELP}[action], parse_mode="HTML", reply_markup=back_keyboard())
+    elif action in ("privacy", "privacy_details", "terms", "help", "help_details"):
+        await show_info(message, action)
     elif action == "paymentstatus":
         await show_payment_status(message, uid)
     elif action == "support":
-        await message.answer("Напиши /paysupport и описание проблемы в одном сообщении. Ответит владелец бота.", reply_markup=back_keyboard())
+        await support_service.open(message, uid)
     else:
         # Old v2 buttons do not delete data or start a roast after the upgrade.
         await message.answer("Меню обновилось. Открой /menu.")
@@ -1264,6 +1327,7 @@ async def bonus_retirement_worker(merchant):
 async def housekeeping():
     while True:
         await store("cleanup")
+        await support_service.call("cleanup")
         await bill("cleanup")
         await asyncio.sleep(300)
 
@@ -1273,6 +1337,8 @@ pay_router.message.register(payment_received, F.successful_payment)
 pay_router.message.register(payment_refunded, F.refunded_payment)
 pay_router.message.register(payment_start, CommandStart())
 pay_router.message.register(support_handler, Command("paysupport", "support"))
+pay_router.message.register(tickets_handler, Command("tickets"))
+pay_router.callback_query.register(ui_callback, F.data.startswith("ui:"))
 pay_router.message.register(owner_handler, Command("reply", "stars", "payments", "refund"))
 pay_router.message.register(payment_status_handler, Command("paymentstatus"))
 pay_router.message.register(myid_handler, Command("myid"))
@@ -1375,7 +1441,7 @@ def backup_before_price_restore():
     if not folder.resolve().is_relative_to(Path(VOLUME_PATH).resolve()):
         raise RuntimeError("Backup directory must stay inside Railway Volume")
     folder.mkdir(parents=True, exist_ok=True, mode=0o700)
-    target = folder / (source.name + ".before-gosha-return-v12.sqlite3")
+    target = folder / (source.name + ".before-support-v13.sqlite3")
 
     def verify(path):
         if path.is_symlink():
@@ -1452,6 +1518,7 @@ async def main():
             BotCommand(command="smart", description="🧠 Умный · Plus"),
             BotCommand(command="help", description="❔ Как общаться"),
             BotCommand(command="terms", description="📜 Условия Plus"),
+            BotCommand(command="support", description="🛟 Поддержка"),
             BotCommand(command="paysupport", description="🛟 Помощь с платежом"),
             BotCommand(command="privacy", description="🔒 О данных"),
         ])
@@ -1462,7 +1529,7 @@ async def main():
                 BotCommand(command="terms", description="📜 Условия"),
                 BotCommand(command="paysupport", description="🛟 Помощь с покупкой"),
             ])
-        logging.warning("Gosha v12 started; bots=%s payments=%s owner_has_no_quota=True", len(bots), payments_ready())
+        logging.warning("Gosha v13 support started; bots=%s payments=%s owner_has_no_quota=True", len(bots), payments_ready())
         if not payments_ready():
             logging.warning("Payment setup checks failed: %s", ", ".join(name for name, ok, _ in payment_checks() if not ok))
         await dp.start_polling(*bots, allowed_updates=["message", "callback_query", "pre_checkout_query"])
