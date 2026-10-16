@@ -419,14 +419,12 @@ def smart_allowed(uid, state):
 
 
 def menu_keyboard(mode="soft", pro=False, uid=None):
-    labels = {"soft": "Мягко", "smart": "Умный", "raw": "Без фильтров"}
+    labels = {"soft": "🌿 Мягко", "smart": "💡 Умный", "raw": "🔥 Без фильтров"}
     rows = [[button(("✓ " if key == mode else "") + labels[key] +
                     (" 🔒" if key == "smart" and not smart_allowed(uid, {"pro": pro}) else ""),
                     "mode:" + key)
              for key in ("soft", "smart", "raw")]]
-    if mode == "smart":
-        rows.append([button("Создать картинку", "ui:image")])
-    rows.append([button("✦ Моя подписка · продлить" if pro else f"✦ Плюс · {billing.PRICE} ⭐ на 7 дней", "ui:pro")])
+    rows.append([button("✨ Мой Plus · продлить" if pro else f"✨ Plus · {billing.PRICE} ⭐ на 7 дней", "ui:pro")])
     if OWNER_ID > 0 and uid == OWNER_ID:
         rows.append([button("🛠 Меню бота", "admin:users:0")])
     rows.append([button("❔ Как общаться", "ui:help"), button("🔒 О данных", "ui:privacy")])
@@ -998,7 +996,7 @@ def smart_reply(text, finish_reason=None):
 
 
 async def generate_picture(message, uid, prompt):
-    progress = await message.answer("🎨 МАСТЕРСКАЯ ГОШИ\nСоздаю картинку по твоему описанию… Это может занять до трёх минут.")
+    progress = await message.answer("🎨 Создаю картинку…")
     delivered = False
     try:
         raw, filename = await asyncio.wait_for(imagegen.create_image(prompt, OPENROUTER_API_KEY, IMAGE_MODEL),
@@ -1013,14 +1011,14 @@ async def generate_picture(message, uid, prompt):
     except imagegen.ImageError as exc:
         logging.warning("Image generation failed: model=%s kind=%s status=%s", IMAGE_MODEL, exc.kind, exc.status)
         if exc.kind == "configuration":
-            await message.answer("🎨 Генерация пока недоступна. Владельцу нужно проверить доступ к модели и баланс OpenRouter. Запрос из лимита не списан.")
+            await message.answer("🎨 Пока недоступно.")
         else:
-            await message.answer("🎨 Не удалось создать картинку. Попробуй другое описание или повтори позже. Запрос из лимита не списан.")
+            await message.answer("🎨 Не получилось. Попробуй позже.")
         return False
     except (TelegramAPIError, asyncio.TimeoutError) as exc:
         logging.warning("Image request/delivery failed: type=%s", type(exc).__name__)
         if not delivered:
-            await message.answer("🎨 Не удалось создать или доставить картинку. Попробуй позже. Запрос из лимита не списан.")
+            await message.answer("🎨 Не получилось. Попробуй позже.")
         return delivered
     finally:
         try:

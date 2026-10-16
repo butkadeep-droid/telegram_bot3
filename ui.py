@@ -2,9 +2,9 @@
 from aiogram.types import InlineKeyboardButton
 
 LABELS = {
- 'ui:menu':'← На главную', 'ui:help':'Как общаться', 'ui:help_details':'Подробнее',
- 'ui:privacy':'О данных', 'ui:privacy_details':'Подробнее о данных', 'ui:terms':'Условия подписки',
- 'ui:support':'Поддержка', 'sup:home':'＋ Новый вопрос', 'sup:list:0':'Обращения',
+ 'ui:menu':'← На главную', 'ui:help':'📖 Как общаться', 'ui:help_details':'Подробнее',
+ 'ui:privacy':'🛡 О данных', 'ui:privacy_details':'Подробнее о данных', 'ui:terms':'Условия подписки',
+ 'ui:support':'💬 Поддержка', 'sup:home':'＋ Новый вопрос', 'sup:list:0':'Обращения',
  'sup:exit':'← К Гоше', 'ui:image':'Создать картинку',
  'ui:agree':'✓ Мне 16+ · продолжить', 'admin:users:0':'Управление ботом',
  'sup:new:pay':'Оплата и подписка', 'sup:new:data':'Мои данные',
