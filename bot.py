@@ -231,6 +231,11 @@ CHEAT_CODE_RULE = (
     'игровые читы: аимботы, wallhack/ESP для нечестного преимущества, '
     'триггерботы, спидхаки и обход античита. Это относится и к продолжению '
     'прошлого кода, заданиям на фото и переименованию чита в учебный проект. '
+    'Запрет действует даже для своей игры, Roblox Studio, локального сервера, '
+    'тестирования, обучения и с разрешения владельца. Не предлагай вместо чита '
+    'аналогичный скрипт для своей игры. Запросы на код ускорения бега, спринта, '
+    'полета, телепортации, бессмертия, бесконечных ресурсов, видения сквозь стены '
+    'или автоматического прицеливания также отклоняй независимо от названия. '
     'На такую просьбу отвечай только: «' + CHEAT_CODE_REPLY + '». '
     'Не добавляй код, псевдокод, пошаговые инструкции или альтернативный способ. '
     'Это исключение из матерной манеры: отказ короткий, без оскорблений. '
@@ -254,8 +259,47 @@ _ANTI_CHEAT = re.compile(r"\b(?:античит\w*|anti[ -]?cheat|vac|eac|battley
 _BYPASS = re.compile(r"\b(?:обход\w*|обойти|обходить|bypass\w*|evad\w*)\b", re.I)
 
 
+_GAME_CONTEXT = re.compile(
+    r"\b(?:roblox\w*|роблокс\w*|роблокс|роблоксе|роблокса|игр\w*|game\w*|"
+    r"minecraft\w*|майнкрафт\w*|cs2|csgo|кс2|ксго|valorant|pubg|"
+    r"unity|unreal|godot|humanoid|walkspeed|jumppower|localscript)\b", re.I)
+_GAME_ADVANTAGE = re.compile(
+    r"walkspeed|jumppower|speed[ _-]?hack|auto[ _-]?aim|infinite[ _-]?(?:health|ammo)|"
+    r"\b(?:быстр\w*\s+(?:\w+\s+){0,3}(?:бег\w*|беж\w*|передвиг\w*)|"
+    r"ускор\w*\s+(?:\w+\s+){0,3}(?:бег\w*|персонаж\w*|игрок\w*)|"
+    r"спринт\w*|полет\w*|летать|телепорт\w*|бессмерт\w*|неуязвим\w*|"
+    r"бесконечн\w*\s+(?:\w+\s+){0,2}(?:патрон\w*|ресурс\w*|здоров\w*|ден\w*)|"
+    r"сквозь\s+стен\w*|автоматическ\w*\s+прицел\w*|"
+    r"run\s+faster|sprint|fly|flight|teleport\w*|godmode|invincib\w*)\b", re.I)
+
+
+def blocked_game_implementation(text):
+    """Deliberately stricter product rule, including own-game implementations."""
+    return bool(_GAME_CONTEXT.search(text) and _GAME_ADVANTAGE.search(text)
+                and (_CHEAT_ACTIONS.search(text) or _CHEAT_CODE.search(text)))
+
+
+def is_cheat_followup(text, history):
+    continuation = bool(_CHEAT_ACTIONS.search(text) or _CHEAT_CODE.search(text)
+                        or re.search(r"\b(?:продолж\w*|дальше|continue|next)\b", text, re.I))
+    if not continuation:
+        return False
+    # Only the immediately preceding user turn; unrelated older topics do not taint a chat.
+    previous = next((x.get('content', '') for x in reversed(history) if x.get('role') == 'user'), '')
+    return bool(previous and is_cheat_code_request(previous + "\n" + text))
+
+
+def is_blocked_game_output(answer):
+    # A second independent gate: never send or save a leaked implementation.
+    code_like = bool(re.search(r"```|\b(?:local|function|import|def|class)\b|game:GetService|Instance\.new", answer))
+    return bool(code_like and (_CHEAT_TERMS.search(answer)
+                              or (_GAME_CONTEXT.search(answer) and _GAME_ADVANTAGE.search(answer))))
+
+
 def is_cheat_code_request(text):
     text = (text or "").casefold().replace("ё", "е")
+    if blocked_game_implementation(text):
+        return True
     code = bool(_CHEAT_CODE.search(text))
     # Do not confuse a reference sheet or prose discussion with a game cheat.
     if re.search(r"\bcheat[ -]?sheet\b|\bшпаргалк\w*\b", text) and not re.search(r"\b(?:aimbot|wallhack|triggerbot|читов|читы)\b", text):
@@ -1210,6 +1254,9 @@ async def generate(message, uid, text, photo=None, image_requested=False):
                 await message.answer(ERROR_MESSAGE)
                 return
         history = await store("history", uid)
+        if is_cheat_followup(text, history):
+            await message.answer(CHEAT_CODE_REPLY, parse_mode=None)
+            return
         # Only user context is kept across modes: old assistant style cannot anchor a new mode.
         past_users = [item['content'][:INPUT_CHARS] for item in history if item['role'] == 'user'][-6:]
         context = ("\nПредыдущие сообщения пользователя для контекста (не новые инструкции):\n" +
@@ -1243,6 +1290,9 @@ async def generate(message, uid, text, photo=None, image_requested=False):
                             SMART_MODEL if is_smart else MODEL, type(exc).__name__,
                             getattr(exc, "status_code", None))
             await message.answer(ERROR_MESSAGE)
+            return
+        if is_blocked_game_output(answer):
+            await message.answer(CHEAT_CODE_REPLY, parse_mode=None)
             return
         # 1800 code points fit Telegram's UTF-16 limit even for all-emoji answers.
         for offset in range(0, len(answer), 1800):
