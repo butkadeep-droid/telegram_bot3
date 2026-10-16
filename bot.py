@@ -349,6 +349,12 @@ def db_init():
                 if table in tables:
                     con.execute(f'INSERT OR IGNORE INTO bot_members(user_id) SELECT DISTINCT user_id FROM "{table}" WHERE user_id > 0')
             con.execute("INSERT OR IGNORE INTO bot_registry_state VALUES('legacy_import_v1','done')")
+        con.execute("""CREATE TABLE IF NOT EXISTS name_notice_v28 (
+            user_id INTEGER PRIMARY KEY, state TEXT NOT NULL DEFAULT 'pending',
+            next_at REAL NOT NULL DEFAULT 0, token TEXT, lease_until REAL NOT NULL DEFAULT 0)""")
+        if not con.execute("SELECT 1 FROM bot_registry_state WHERE key='name_notice_v28_seeded'").fetchone():
+            con.execute("INSERT OR IGNORE INTO name_notice_v28(user_id) SELECT user_id FROM bot_members WHERE user_id > 0")
+            con.execute("INSERT INTO bot_registry_state VALUES('name_notice_v28_seeded','done')")
     support_service.init()
 
 
@@ -357,6 +363,19 @@ def db_run(action, uid=0, value=None):
     day = datetime.now(timezone.utc).date().isoformat()
     now = time.time()
     with closing(sqlite3.connect(DB, timeout=10)) as con, con:
+        if action == "name_notice_claim":
+            con.execute("BEGIN IMMEDIATE")
+            row = con.execute("SELECT user_id FROM name_notice_v28 WHERE state='pending' AND next_at<=? AND lease_until<=? ORDER BY user_id LIMIT 1", (now, now)).fetchone()
+            if not row:
+                return None
+            token = secrets.token_hex(16)
+            con.execute("UPDATE name_notice_v28 SET token=?,lease_until=? WHERE user_id=?", (token, now+120, row[0]))
+            return {"user_id": row[0], "token": token}
+        if action == "name_notice_finish":
+            if value['state'] not in ('sent', 'blocked', 'pending'):
+                raise ValueError("Invalid notice state")
+            con.execute("UPDATE name_notice_v28 SET state=?,next_at=?,token=NULL,lease_until=0 WHERE user_id=? AND token=?", (value['state'], now+max(0,value.get('delay',0)), uid, value['token']))
+            return
         if action == "member_seen":
             if uid > 0:
                 username = str(value).lstrip("@")[:32] if value else None
@@ -392,6 +411,7 @@ def db_run(action, uid=0, value=None):
         elif action == "reset":
             con.execute("DELETE FROM messages WHERE user_id=?", (uid,))
         elif action == "delete":
+            con.execute("DELETE FROM name_notice_v28 WHERE user_id=?", (uid,))
             con.execute("DELETE FROM messages WHERE user_id=?", (uid,))
             con.execute("DELETE FROM users WHERE user_id=?", (uid,))
             con.execute("DELETE FROM bot_members WHERE user_id=?", (uid,))
@@ -1661,6 +1681,56 @@ async def bonus_retirement_worker(merchant):
         await asyncio.sleep(0.1 if worked else 30)
 
 
+NAME_NOTICE_TEXT = (
+    "👋 Немного обновил название — теперь я Gosha AI.\n\n"
+    "Это всё тот же Гоша. История, подписка и настройки остались на месте.\n"
+    "Продолжаем общаться: /menu"
+)
+
+
+async def send_name_notice(merchant):
+    item = await store("name_notice_claim")
+    if item is None:
+        return False
+    uid = item['user_id']
+    result = {'token': item['token'], 'state': 'sent'}
+    try:
+        await merchant.send_message(uid, NAME_NOTICE_TEXT, parse_mode=None,
+                                    disable_notification=True, request_timeout=15)
+    except TelegramRetryAfter as exc:
+        result.update(state='pending', delay=max(1, exc.retry_after)+1)
+        await store("name_notice_finish", uid, result)
+        await asyncio.sleep(max(1, exc.retry_after)+1)
+        return True
+    except (TelegramForbiddenError, TelegramBadRequest):
+        result['state'] = 'blocked'
+    except (TelegramAPIError, OSError, asyncio.TimeoutError) as exc:
+        logging.warning("Name notice deferred: type=%s", type(exc).__name__)
+        result.update(state='pending', delay=300)
+    await store("name_notice_finish", uid, result)
+    return True
+
+
+async def name_notice_worker(merchant):
+    # Do not announce a rename that Telegram has not accepted yet.
+    while True:
+        try:
+            default = await merchant.get_my_name(request_timeout=10)
+            russian = await merchant.get_my_name(language_code="ru", request_timeout=10)
+            if default.name == russian.name == "Gosha AI":
+                break
+        except (TelegramAPIError, OSError, asyncio.TimeoutError):
+            pass
+        await asyncio.sleep(30)
+    while True:
+        try:
+            worked = await send_name_notice(merchant)
+        except Exception as exc:
+            logging.warning("Name notice queue deferred: type=%s", type(exc).__name__)
+            worked = False
+        await asyncio.sleep(0.2 if worked else 30)
+
+
 async def housekeeping():
     while True:
         await store("cleanup")
@@ -1726,7 +1796,7 @@ async def configure_payment_bot(main_bot):
     return None, ""
 
 
-BOT_DESCRIPTION = "Гоша — ИИ-друг с характером. Общение, юмор и дерзость. 16+."
+BOT_DESCRIPTION = "Gosha AI — ИИ-друг с характером. Общение, юмор и дерзость. 16+."
 
 
 async def update_bot_description(merchant):
@@ -1742,7 +1812,7 @@ async def update_bot_description(merchant):
 async def apply_brand(merchant, payment=False):
     if not payment:
         await update_bot_description(merchant)
-    name = "Гоша · Оплата" if payment else "Гоша"
+    name = "Гоша · Оплата" if payment else "Gosha AI"
     try:
         await merchant.set_my_name(name=name)
         await merchant.set_my_name(name=name, language_code="ru")
@@ -1846,6 +1916,7 @@ async def main():
             await merchant.delete_webhook(drop_pending_updates=False)
             await apply_brand(merchant, payment=PAYMENT_BOT is not None and merchant.id == PAYMENT_BOT.id)
         tasks.append(asyncio.create_task(bonus_retirement_worker(MAIN_BOT)))
+        tasks.append(asyncio.create_task(name_notice_worker(MAIN_BOT)))
         await MAIN_BOT.set_my_commands([
             BotCommand(command="menu", description="🎛 Главное меню"),
             BotCommand(command="plus", description=f"💠 Плюс · 7 дней за {billing.PRICE} ⭐"),
@@ -1866,7 +1937,7 @@ async def main():
                 BotCommand(command="terms", description="📜 Условия"),
                 BotCommand(command="paysupport", description="🛟 Помощь с покупкой"),
             ])
-        logging.warning("Gosha v24 GLM 5.3 Flash and no cheat code requests; bots=%s payments=%s owner_has_no_quota=True", len(bots), payments_ready())
+        logging.warning("Gosha v28 name update and one-time notice; bots=%s payments=%s owner_has_no_quota=True", len(bots), payments_ready())
         if not payments_ready():
             logging.warning("Payment setup checks failed: %s", ", ".join(name for name, ok, _ in payment_checks() if not ok))
         await dp.start_polling(*bots, allowed_updates=["message", "callback_query", "pre_checkout_query"])
