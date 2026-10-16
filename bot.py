@@ -49,9 +49,9 @@ PAYMENT_BOT_TOKEN = os.getenv("PAYMENT_BOT_TOKEN", "").strip()
 # на файл в подключённом постоянном диске хостинга.
 DB = Path(os.getenv("DB_PATH", "data/gosha.sqlite3"))
 MODEL = os.getenv("MODEL", "deepseek/deepseek-chat")
-# Gemini 4 Argon is selected explicitly for Smart; uses the existing OpenRouter key.
+# GLM 5.3 Flash is selected explicitly for Smart; uses the existing OpenRouter key.
 # An old SMART_MODEL environment value must not silently keep the previous model.
-SMART_MODEL = "google/gemini-4-argon"
+SMART_MODEL = "z-ai/glm-5.3-flash"
 SMART_INPUT_CHARS = 8000
 SMART_OUTPUT_CHARS = 6000
 SMART_HISTORY_CHARS = 12000
@@ -223,6 +223,53 @@ def is_identity_question(text):
     if re.search(r"\b(?:реши|посчитай|переведи|напиши|объясни|помоги|solve|calculate|translate|explain)\b", text):
         return False
     return any(p.search(text) for p in _IDENTITY_PATTERNS)
+
+
+CHEAT_CODE_REPLY = "Код для читов и обхода античита писать не буду."
+CHEAT_CODE_RULE = (
+    'Не пиши и не помогай дорабатывать, исправлять, отлаживать или маскировать '
+    'игровые читы: аимботы, wallhack/ESP для нечестного преимущества, '
+    'триггерботы, спидхаки и обход античита. Это относится и к продолжению '
+    'прошлого кода, заданиям на фото и переименованию чита в учебный проект. '
+    'На такую просьбу отвечай только: «' + CHEAT_CODE_REPLY + '». '
+    'Не добавляй код, псевдокод, пошаговые инструкции или альтернативный способ. '
+    'Это исключение из матерной манеры: отказ короткий, без оскорблений. '
+    'Обычное программирование, безопасная разработка античита, объяснение понятия '
+    'на общем уровне и шпаргалки cheat sheet сами по себе не являются созданием чита.'
+)
+SYSTEM += "\n" + CHEAT_CODE_RULE
+SMART_SYSTEM += "\n" + CHEAT_CODE_RULE
+
+_CHEAT_TERMS = re.compile(
+    r"\b(?:чит(?:а|у|ом|е|ы|ов|ам|ами|ах)?|читерск\w*|аимбот\w*|эймбот\w*|"
+    r"aimbot\w*|wallhack\w*|валлхак\w*|воллхак\w*|триггербот\w*|triggerbot\w*|"
+    r"спидхак\w*|speedhack\w*|автоприцел\w*|cheats?|noclip)\b", re.I)
+_CHEAT_ACTIONS = re.compile(
+    r"\b(?:напиш\w*|написать|сдела\w*|созда\w*|разработ\w*|сгенер\w*|"
+    r"доработ\w*|исправ\w*|почин\w*|отлад\w*|реализ\w*|добав\w*|"
+    r"перепиш\w*|портир\w*|дай|пришли|нужен|нужно|хочу|"
+    r"write|create|build|make|implement|fix|debug|develop|generate|give|send|port|add)\b", re.I)
+_CHEAT_CODE = re.compile(r"\b(?:код\w*|скрипт\w*|исходник\w*|программ\w*|code|script|source|python)\b|c\+\+", re.I)
+_ANTI_CHEAT = re.compile(r"\b(?:античит\w*|anti[ -]?cheat|vac|eac|battleye|vanguard)\b", re.I)
+_BYPASS = re.compile(r"\b(?:обход\w*|обойти|обходить|bypass\w*|evad\w*)\b", re.I)
+
+
+def is_cheat_code_request(text):
+    text = (text or "").casefold().replace("ё", "е")
+    code = bool(_CHEAT_CODE.search(text))
+    # Do not confuse a reference sheet or prose discussion with a game cheat.
+    if re.search(r"\bcheat[ -]?sheet\b|\bшпаргалк\w*\b", text) and not re.search(r"\b(?:aimbot|wallhack|triggerbot|читов|читы)\b", text):
+        return False
+    if not code and re.search(r"\b(?:рассказ|статью|эссе|сочинени\w*|стих\w*|правила|политику|переведи|translate|article|story)\b", text):
+        return False
+    # Detection/defence code is allowed, but a request to bypass protection is not.
+    bypass = bool(_ANTI_CHEAT.search(text) and _BYPASS.search(text))
+    if not bypass and re.search(r"\b(?:для|по) (?:обнаружени\w*|выявлени\w*|блокировк\w*|детект\w*) (?:читов|читер\w*|aimbots?)\b", text):
+        return False
+    target = bool(_CHEAT_TERMS.search(text))
+    if not target and re.search(r"\b(?:esp|wh)\b", text):
+        target = bool(re.search(r"\b(?:cs2|csgo|кс2|ксго|valorant|pubg|игр\w*|game\w*)\b", text))
+    return bypass or (target and (code or bool(_CHEAT_ACTIONS.search(text))))
 
 
 def db_init():
@@ -1096,6 +1143,9 @@ async def generate(message, uid, text, photo=None, image_requested=False):
     row = await consent(message, uid)
     if not row:
         return
+    if is_cheat_code_request(text):
+        await message.answer(CHEAT_CODE_REPLY, parse_mode=None)
+        return
     if photo is None and not image_requested and is_identity_question(text):
         await message.answer(IDENTITY_REPLY, parse_mode=None)
         return
@@ -1749,7 +1799,7 @@ async def main():
                 BotCommand(command="terms", description="📜 Условия"),
                 BotCommand(command="paysupport", description="🛟 Помощь с покупкой"),
             ])
-        logging.warning("Gosha v22 fixed Gosha identity; bots=%s payments=%s owner_has_no_quota=True", len(bots), payments_ready())
+        logging.warning("Gosha v24 GLM 5.3 Flash and no cheat code requests; bots=%s payments=%s owner_has_no_quota=True", len(bots), payments_ready())
         if not payments_ready():
             logging.warning("Payment setup checks failed: %s", ", ".join(name for name, ok, _ in payment_checks() if not ok))
         await dp.start_polling(*bots, allowed_updates=["message", "callback_query", "pre_checkout_query"])
