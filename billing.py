@@ -64,6 +64,10 @@ def init(path):
             granted_at REAL
         );
         CREATE INDEX IF NOT EXISTS pro_gifts_user ON pro_gifts(user_id, granted_at);
+        CREATE TABLE IF NOT EXISTS pro_revoke_requests (
+            revoke_id TEXT PRIMARY KEY,user_id INTEGER NOT NULL,owner_id INTEGER NOT NULL,
+            created REAL NOT NULL,expected_until REAL NOT NULL,executed_at REAL
+        );
         CREATE TABLE IF NOT EXISTS bonus_retirement_notices (
             user_id INTEGER PRIMARY KEY, created REAL NOT NULL,
             state TEXT NOT NULL DEFAULT 'pending', next_attempt REAL NOT NULL DEFAULT 0,
@@ -81,6 +85,8 @@ def init(path):
             ('pro_orders', 'price', 'INTEGER NOT NULL DEFAULT 5'),
             ('pro_charges', 'merchant_id', 'INTEGER NOT NULL DEFAULT 0'),
             ('pro_refunds', 'merchant_id', 'INTEGER NOT NULL DEFAULT 0'),
+            ('pro_charges', 'revoked_at', 'REAL'),
+            ('pro_gifts', 'revoked_at', 'REAL'),
         ]:
             columns = {row['name'] for row in con.execute(f'PRAGMA table_info({table})')}
             if column not in columns:
@@ -105,9 +111,9 @@ def pro_until(con, uid):
 def recompute(con, uid):
     expiry = 0.0
     events = [(row[0], 0, row[1], DURATION) for row in con.execute(
-        "SELECT paid_at,charge_id FROM pro_charges WHERE user_id=? AND state='granted'", (uid,))]
+        "SELECT paid_at,charge_id FROM pro_charges WHERE user_id=? AND state='granted' AND revoked_at IS NULL", (uid,))]
     events += [(row[0], 1, row[1], row[2]) for row in con.execute(
-        "SELECT granted_at,gift_id,duration_seconds FROM pro_gifts WHERE user_id=? AND granted_at IS NOT NULL", (uid,))]
+        "SELECT granted_at,gift_id,duration_seconds FROM pro_gifts WHERE user_id=? AND granted_at IS NOT NULL AND revoked_at IS NULL", (uid,))]
     for when, _, event_id, duration in sorted(events):
         expiry = max(expiry, when) + duration
     con.execute('INSERT INTO pro_entitlements VALUES(?,?) ON CONFLICT(user_id) DO UPDATE SET until_ts=excluded.until_ts', (uid, expiry))
@@ -133,8 +139,33 @@ def snapshot(con, uid, now):
 def run(path, action, uid=0, value=None, now=None):
     now = time.time() if now is None else float(now)
     with closing(connect(path)) as con, con:
-        if action in ('reserve', 'payment', 'refund', 'precheck', 'gosha_bonus', 'gift_grant', 'bonus_notice_claim', 'bonus_notice_finish'):
+        if action in ('reserve', 'payment', 'refund', 'precheck', 'gosha_bonus', 'gift_grant', 'bonus_notice_claim', 'bonus_notice_finish', 'revoke_prepare', 'revoke_apply'):
             con.execute('BEGIN IMMEDIATE')
+        if action == 'revoke_prepare':
+            recipient=int(value['recipient_id'])
+            if uid<=0 or recipient<=0 or uid==recipient:
+                return {'state':'invalid'}
+            until=pro_until(con,recipient)
+            if until<=now:return {'state':'inactive'}
+            con.execute('INSERT INTO pro_revoke_requests VALUES(?,?,?,?,?,NULL)',
+                        (value['token'],recipient,uid,now,until))
+            return {'state':'prepared','until':until}
+        if action == 'revoke_apply':
+            request=con.execute('SELECT * FROM pro_revoke_requests WHERE revoke_id=? AND owner_id=?',(value,uid)).fetchone()
+            if not request:return {'state':'invalid'}
+            recipient=request['user_id']
+            if request['executed_at'] is not None:return {'state':'duplicate','user_id':recipient}
+            if now-request['created']>GIFT_TTL:return {'state':'expired'}
+            until=pro_until(con,recipient)
+            if until!=request['expected_until']:return {'state':'changed'}
+            if until<=now:return {'state':'inactive'}
+            # Preserve payment/refund accounting. Exclude only prior grants from all future recomputations.
+            con.execute("UPDATE pro_charges SET revoked_at=? WHERE user_id=? AND state='granted' AND revoked_at IS NULL",(now,recipient))
+            con.execute('UPDATE pro_gifts SET revoked_at=? WHERE user_id=? AND granted_at IS NOT NULL AND revoked_at IS NULL',(now,recipient))
+            con.execute('DELETE FROM pro_gifts WHERE user_id=? AND granted_at IS NULL',(recipient,))
+            con.execute('UPDATE pro_revoke_requests SET executed_at=? WHERE revoke_id=?',(now,value))
+            recompute(con,recipient)
+            return {'state':'revoked','user_id':recipient,'until':until}
         if action == 'gift_prepare':
             recipient = int(value['recipient_id'])
             if uid <= 0 or recipient <= 0:
@@ -263,6 +294,7 @@ def run(path, action, uid=0, value=None, now=None):
         if action == 'payments':
             return [dict(row) for row in con.execute('SELECT * FROM pro_charges ORDER BY paid_at DESC LIMIT 10')]
         if action == 'cleanup':
+            con.execute('DELETE FROM pro_revoke_requests WHERE executed_at IS NULL AND created<?',(now-86400,))
             con.execute('DELETE FROM hour_usage WHERE at_ts<=?', (now - WINDOW,))
             con.execute('DELETE FROM smart_hour_usage WHERE at_ts<=?', (now - WINDOW,))
             con.execute("DELETE FROM bonus_retirement_notices WHERE state IN ('sent','blocked') AND created<?", (now-90*86400,))

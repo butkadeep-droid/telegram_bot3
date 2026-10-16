@@ -49,8 +49,9 @@ PAYMENT_BOT_TOKEN = os.getenv("PAYMENT_BOT_TOKEN", "").strip()
 # на файл в подключённом постоянном диске хостинга.
 DB = Path(os.getenv("DB_PATH", "data/gosha.sqlite3"))
 MODEL = os.getenv("MODEL", "deepseek/deepseek-chat")
-# Same OpenRouter key; only the Плюс/Owner smart mode uses this model.
-SMART_MODEL = os.getenv("SMART_MODEL", "google/gemini-3.1-flash-lite").strip() or "google/gemini-3.1-flash-lite"
+# Gemini 4 Argon is selected explicitly for Smart; uses the existing OpenRouter key.
+# An old SMART_MODEL environment value must not silently keep the previous model.
+SMART_MODEL = "google/gemini-4-argon"
 SMART_INPUT_CHARS = 8000
 SMART_OUTPUT_CHARS = 6000
 SMART_HISTORY_CHARS = 12000
@@ -81,7 +82,8 @@ if MAX_CONCURRENT < 1 or COOLDOWN < 0 or OWNER_ID < 0:
     raise ValueError("Invalid limits")
 HISTORY_MESSAGES = 24
 INPUT_CHARS = 2000
-OUTPUT_CHARS = 220
+OUTPUT_CHARS = 1200
+NORMAL_MAX_TOKENS = 500
 BASE_DIR = Path(__file__).resolve().parent
 WELCOME_PHOTO = BASE_DIR / "welcome.jpg"
 AVATAR_PHOTO = BASE_DIR / "avatar.jpg"
@@ -92,8 +94,13 @@ SMART_PHOTO = BASE_DIR / "smart.jpg"
 SYSTEM = """Ты — Гоша, вымышленный дерзкий ИИ-собеседник. По-русски, на «ты». Говори о себе в мужском роде.
 Не рассказывай анекдоты, истории, притчи и мотивационные лекции. Не начинай
 со случайной шутки. Реагируй ПРЯМО на последнюю реплику пользователя.
-Одна короткая реплика: 1–2 предложения, 40–180 символов, максимум 220.
-Без списков, Markdown, длинных объяснений и фраз «как ИИ».
+Сначала дай понятный и правильный ответ на вопрос, потом при необходимости подкол.
+На простой вопрос хватит 1–3 предложений. Если нужно объяснение, дай несколько
+коротких шагов; не обрывай мысль ради шутки. Максимум 1200 символов.
+Не отвечай загадками, бессвязными метафорами и случайными оскорблениями вместо ответа.
+На «что это», «как», «почему» отвечай определением, действием или причиной.
+Не выдумывай факты. Если не хватает существенных данных, задай один точный вопрос.
+Не пиши вступлений и фраз «как ИИ».
 Манеру и допустимость мата определяет ТОЛЬКО текущий режим ниже.
 Старые ответы в истории могли быть в другом режиме: НЕ перенимай их стиль.
 В жёстких режимах собеседник добровольно согласился на постановочную
@@ -114,21 +121,45 @@ MODES = {
     "soft": """ТЕКУЩИЙ РЕЖИМ: МЯГКО. Ни одного матерного слова и ни одного
 личного оскорбления. Спокойный прямой ответ с лёгкой иронией, без панчей ради панчей.
 Пример: пользователь «Чего молчишь?» — «Ждал, когда появится вопрос интереснее этого.»""",
-    "raw": """ТЕКУЩИЙ РЕЖИМ: БЕЗ ФИЛЬТРОВ. Самая резкая постановочная
-перепалка. Адресуй реплику пользователю напрямую, не развлекай его историями.
-Одно-два настоящих матерных слова без цензуры плюс прямой грубый выпад.
-Можно шуточно обзывать «тупица», «клоун», отвечать «иди в жопу»; без угроз
-и без утверждений, что его жизнь ничего не стоит. Не заканчивай советом.
-Пример: пользователь «Чего молчишь?» — «Ты, блядь, зашёл по делу или просто тишину заебать?»
-Пример: пользователь «Что делаешь?» — «Пытаюсь понять, нахуя ты опять пришёл без вопроса, клоун.»""",
+    "raw": """ТЕКУЩИЙ РЕЖИМ: БЕЗ ФИЛЬТРОВ. Это постоянная дерзкая манера,
+а не опция, которую нужно включать отдельно. Говори с разнообразным матом
+без звёздочек и запикивания. В КАЖДОМ обычном ответе используй мат
+и адресный комичный подкол собеседника; прямой грубый выпад — часть этой
+добровольной постановочной перепалки. Даже на простой вопрос не переходи
+в сухой вежливый тон. При этом первым делом ДАЙ ВЕРНЫЙ И ПОНЯТНЫЙ ОТВЕТ.
+Ругательства связывай с темой, а не приклеивай бессмысленной строкой в конце.
+Меняй слова и обороты: «блядь», «ёбаный», «нахуя», «заебись», «пиздец»,
+«охуеть», «хуёво», «нихуя себе», «заебал» и естественные производные.
+Не зацикливайся на «блядь» и не повторяй один панч из сообщения в сообщение.
+Подкол адресуй текущей реплике или действию: «клоун», «балбес», «засранец»,
+«хитрожопый». Не выдумывай биографию и недостатки человека.
+Обычно хватает 1–3 крепких оборотов и одного точного подкола. Не перечисляй мат
+ради количества: связная живая речь важнее, чем ругательство через слово.
+На «почему» дай причину; на «как» — рабочие шаги; на задачу — результат
+и понятное объяснение. Не заменяй ответ оскорблением или загадкой.
+Код, числа, формулы и обязательные форматы не порть: ругань — в обычном пояснении.
+Не переходи к угрозам, травле третьих людей или унижению по идентичности.
+Не обесценивай жизнь человека. Если попросили остановить ругань, убери её;
+при кризисе и просьбе о реальной поддержке следуй правилам безопасности выше.
+Пример: «Сколько будет 17 × 6?» — «102, блядь: 17 × 3 = 51, ещё раз столько — 102.
+Вот и вся арифметика, хитрожопый.»""",
 }
 ALL_MODES = (*MODES, "smart")
 MODE_NAMES = {"soft": "😌 Мягко", "raw": "💀 Без фильтров", "smart": "🧠 Умный"}
 SMART_SYSTEM = """Ты — Гоша, вымышленный ИИ-друг с характером. Говори о себе в мужском роде.
 ТЕКУЩИЙ РЕЖИМ: УМНЫЙ. Твоя главная задача — правильно решить задачу, объяснить
 непонятное, проверить расчёт или помочь с кодом. Реагируй на текущий вопрос.
-Сначала полезный ответ, затем, если уместно, один короткий дружеский подкол;
-допустим умеренный мат без цензуры, но не заменяй им решение и не унижай человека.
+Сначала точный ответ по сути, затем понятное объяснение. Дерзкая манера и мат
+включены постоянно: в каждом обычном разговорном пояснении используй
+естественный разнообразный мат без цензуры, а не только когда отдельно попросили.
+Меняй слова и обороты по ситуации: «блядь», «заебись», «пиздец», «охуеть»,
+«нахуя», «ёбаный», «хуёво», «нихуя себе». Не повторяй одно слово в каждом ответе.
+Мата здесь меньше, чем в «Без фильтров»: полезность, точность и ясность — первые.
+Не превращай объяснение в набор ругательств и не унижай человека за незнание.
+Код, формулы, числа и требуемые строгие форматы не изменяй ради мата;
+используй его только в собственном обычном пояснении.
+Не отвечай туманными метафорами. Сначала сам результат или прямой ответ,
+затем понятные шаги. При нехватке данных задай конкретный вопрос.
 Если просят без грубости — сразу убери её. На нейтральное приветствие отвечай коротко.
 Для задачи покажи основные шаги вычислений или объяснения и явно выдели итог.
 Это краткое обоснование ответа, а не внутренние размышления и не черновик.
@@ -540,9 +571,9 @@ async def show_info(message, action):
 
 
 def compact_reply(text):
-    text = re.sub(r"\s+", " ", (text or "").strip())
-    text = text.replace("**", "").replace("__", "").strip('"«» ')
-    text = " ".join(re.split(r"(?<=[.!?…])\s+(?=[А-ЯЁA-Z0-9])", text)[:2])
+    text = re.sub(r"<think\b[^>]*>.*?(?:</think>|$)", "", text or "", flags=re.S | re.I).strip()
+    text = "\n".join(line.rstrip() for line in text.splitlines())
+    text = re.sub(r"\n{3,}", "\n\n", text)
     if len(text) <= OUTPUT_CHARS:
         return text
     short = text[:OUTPUT_CHARS - 1]
@@ -1109,7 +1140,7 @@ async def generate(message, uid, text, photo=None, image_requested=False):
             else:
                 response = await asyncio.wait_for(client.chat.completions.create(
                     model=MODEL, messages=messages,
-                    temperature={"soft": 0.55, "raw": 1.0}[mode], max_tokens=120,
+                    temperature={"soft": 0.55, "raw": 0.8}[mode], max_tokens=NORMAL_MAX_TOKENS,
                 ), timeout=55)
                 answer = compact_reply(response.choices[0].message.content if response.choices else "")
             if not answer:
@@ -1188,12 +1219,13 @@ async def show_bot_admin(message, uid, page=0, edit=False):
             f"👥 Пользователи: <b>{roster['total']}</b>\n\n" + members_table(roster['rows']) +
             f"\n\n📄 Страница {page + 1}/{roster['pages']}\n"
             "— = юзернейм не указан или пока неизвестен.\n"
-            "🎁 Справа от каждого пользователя ниже — подарок Плюс на 24 часа.")
+            "🎁 Подарить Плюс на сутки · ⊖ Снять Плюс с подтверждением.")
     rows = []
     for recipient_id, username in roster['rows']:
         label = ("@" + username) if username else "Без юзернейма"
         rows.append([InlineKeyboardButton(text=f"👤 {label} · {recipient_id}", url=f"tg://user?id={recipient_id}"),
-                     button("🎁 Плюс на 1 день", f"admin:giftstart:{recipient_id}:{page}")])
+                     button("🎁 Плюс на 1 день", f"admin:giftstart:{recipient_id}:{page}"),
+                     button("⊖ Снять Плюс", f"admin:revokestart:{recipient_id}:{page}")])
     nav = []
     if page > 0:
         nav.append(button("⬅️ Назад", f"admin:users:{page - 1}"))
@@ -1303,6 +1335,66 @@ async def admin_gift_confirm(query: CallbackQuery):
     if not delivered:
         text += "\nУведомление не доставлено, но доступ сохранён."
     await query.message.answer(text, reply_markup=keyboard)
+
+
+@router.callback_query(F.data.startswith("admin:revokestart:"))
+async def admin_revoke_start(query: CallbackQuery):
+    owner=query.from_user.id
+    if not owner_admin_allowed(query.message,owner):
+        await query.message.answer("⛔ Снять Плюс может только владелец.");return
+    parts=query.data.split(":")
+    if len(parts)!=4 or not re.fullmatch(r"[0-9]{1,19}",parts[2]):
+        await query.message.answer("Открой таблицу заново.");return
+    recipient=int(parts[2]);page=admin_page(parts[3])
+    if recipient<=0 or recipient>9223372036854775807 or page is None:
+        await query.message.answer("Открой таблицу заново.");return
+    if recipient==owner:
+        await query.message.answer("У владельца доступ без подписки — снимать нечего.");return
+    member=await store("member",owner,recipient)
+    if not member:
+        await query.message.answer("Пользователь не найден. Обнови таблицу.");return
+    token=secrets.token_urlsafe(16)
+    result=await bill("revoke_prepare",owner,{"token":token,"recipient_id":recipient})
+    kb=InlineKeyboardMarkup(inline_keyboard=[[button("← К таблице",f"admin:users:{page}")]])
+    if result['state']!='prepared':
+        await query.message.answer("У пользователя нет активного Плюс.",reply_markup=kb);return
+    username='@'+member[1] if member[1] else 'без юзернейма'
+    text=("<b>⊖ Снять Плюс?</b>\n\n"+f"{escape(username)} · <code>{recipient}</code>\n"
+          +f"Сейчас действует до {utc_date(result['until'])}.\n\n"
+          +"Будет снят весь действующий доступ, включая оплаченный срок. "
+          +"Звёзды автоматически не возвращаются. Подтверждение действует 10 минут.")
+    kb.inline_keyboard.insert(0,[button("Да, снять Плюс",f"admin:revokeconfirm:{token}:{page}")])
+    await query.message.answer(text,parse_mode="HTML",reply_markup=kb)
+
+
+@router.callback_query(F.data.startswith("admin:revokeconfirm:"))
+async def admin_revoke_confirm(query: CallbackQuery):
+    owner=query.from_user.id
+    if not owner_admin_allowed(query.message,owner):
+        await query.message.answer("⛔ Снять Плюс может только владелец.");return
+    parts=query.data.split(":")
+    if len(parts)!=4 or not re.fullmatch(r"[A-Za-z0-9_-]{16,40}",parts[2]):
+        await query.message.answer("Подтверждение недействительно.");return
+    page=admin_page(parts[3])
+    if page is None:
+        await query.message.answer("Открой таблицу заново.");return
+    result=await bill("revoke_apply",owner,parts[2])
+    kb=InlineKeyboardMarkup(inline_keyboard=[[button("← К таблице",f"admin:users:{page}")]])
+    if result['state']=='duplicate':
+        await query.message.answer("Плюс уже снят. Повторных действий нет.",reply_markup=kb);return
+    if result['state']=='changed':
+        await query.message.answer("Срок подписки изменился. Открой таблицу и подтверди снятие заново.",reply_markup=kb);return
+    if result['state']!='revoked':
+        await query.message.answer("Снятие не выполнено. Открой таблицу заново.",reply_markup=kb);return
+    recipient=result['user_id']
+    await store("mode",recipient,"soft")
+    delivered=True
+    try:
+        await query.message.bot.send_message(recipient,"Владелец отключил твой Плюс. Обычные режимы доступны. /menu",parse_mode=None)
+    except TelegramAPIError:delivered=False
+    text=f"✓ Плюс снят · {recipient}."
+    if not delivered:text+=" Уведомление не доставлено."
+    await query.message.answer(text,reply_markup=kb)
 
 
 @router.callback_query(F.data.startswith("mode:"))
@@ -1616,7 +1708,7 @@ async def main():
                 BotCommand(command="terms", description="📜 Условия"),
                 BotCommand(command="paysupport", description="🛟 Помощь с покупкой"),
             ])
-        logging.warning("Gosha v19 no image generation; bots=%s payments=%s owner_has_no_quota=True", len(bots), payments_ready())
+        logging.warning("Gosha v21 Gemini 4 Argon and permanent mode styles; bots=%s payments=%s owner_has_no_quota=True", len(bots), payments_ready())
         if not payments_ready():
             logging.warning("Payment setup checks failed: %s", ", ".join(name for name, ok, _ in payment_checks() if not ok))
         await dp.start_polling(*bots, allowed_updates=["message", "callback_query", "pre_checkout_query"])
