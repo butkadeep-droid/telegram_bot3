@@ -1182,6 +1182,16 @@ async def image_handler(message: Message):
     await image_prompt(message, message.from_user.id)
 
 
+def private_owner_identity(message, uid):
+    return (OWNER_ID > 0 and uid == OWNER_ID
+            and getattr(getattr(message, "chat", None), "type", None) == "private")
+
+
+def configured_model_identity(mode):
+    model = SMART_MODEL if mode == "smart" else MODEL
+    return f"В этом режиме настроена модель {model} через OpenRouter."
+
+
 async def generate(message, uid, text, photo=None, image_requested=False):
     global in_flight
     row = await consent(message, uid)
@@ -1191,7 +1201,8 @@ async def generate(message, uid, text, photo=None, image_requested=False):
         await message.answer(CHEAT_CODE_REPLY, parse_mode=None)
         return
     if photo is None and not image_requested and is_identity_question(text):
-        await message.answer(IDENTITY_REPLY, parse_mode=None)
+        reply = configured_model_identity(row[1]) if private_owner_identity(message, uid) else IDENTITY_REPLY
+        await message.answer(reply, parse_mode=None)
         return
     mode = row[1] if row[1] in ALL_MODES else "soft"
     is_smart = mode == "smart"
@@ -1265,6 +1276,12 @@ async def generate(message, uid, text, photo=None, image_requested=False):
             {"role": "system", "content": SYSTEM + "\n" + MODES[mode]},
             {"role": "user", "content": (context + "\n\nТекущее сообщение:\n" if context else "") + text},
         ]
+        if private_owner_identity(message, uid):
+            messages[0]["content"] = messages[0]["content"].replace(
+                IDENTITY_RULE,
+                "Самоописание: " + configured_model_identity(mode)
+                + " На вопрос о модели укажи этот идентификатор; не выдумывай архитектуру "
+                  "или фактический backend поставщика. Ответь и на остальную часть вопроса.")
         await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
         try:
             if is_smart:
