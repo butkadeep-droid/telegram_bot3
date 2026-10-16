@@ -10,6 +10,8 @@ import math
 import hashlib
 from html import escape
 import billing
+import imagegen
+from ui import button as themed_button
 from support import Support, SupportMiddleware
 import sqlite3
 import time
@@ -23,7 +25,7 @@ from aiogram.exceptions import TelegramBadRequest, TelegramAPIError, TelegramNet
 from aiogram.filters import BaseFilter, Command, CommandStart
 from aiogram.types import (Message, CallbackQuery, InlineKeyboardButton,
                            InlineKeyboardMarkup, FSInputFile, BotCommand, MenuButtonCommands,
-                           PreCheckoutQuery, LabeledPrice, InputProfilePhotoStatic)
+                           PreCheckoutQuery, LabeledPrice, InputProfilePhotoStatic, BufferedInputFile)
 from aiogram.utils.token import TokenValidationError
 from dotenv import load_dotenv
 from openai import AsyncOpenAI, APIError
@@ -55,6 +57,8 @@ SMART_OUTPUT_CHARS = 6000
 SMART_HISTORY_CHARS = 12000
 SMART_MAX_TOKENS = 1600
 SMART_TIMEOUT = 65
+IMAGE_MODEL = os.getenv("IMAGE_MODEL", imagegen.DEFAULT_MODEL).strip() or imagegen.DEFAULT_MODEL
+MAX_IMAGE_CONCURRENT = 2
 MAX_PHOTO_BYTES = 10 * 1024 * 1024
 PHOTO_DEFAULT_TASK = "Прочитай условие задачи на фотографии и реши её. Если задач несколько и неясно, какую решать, уточни номер."
 def read_owner_id(environ=None):
@@ -278,6 +282,7 @@ pay_router.callback_query.filter(F.message.chat.type == ChatType.PRIVATE, BotRol
 support_service = Support(lambda: DB, lambda: OWNER_ID)
 client = None
 in_flight = 0
+image_in_flight = 0
 ERROR_MESSAGE = "Сервера сдохли"
 PRO_PHOTO = BASE_DIR / "pro.jpg"
 
@@ -398,8 +403,8 @@ def utc_date(ts):
     return datetime.fromtimestamp(ts, timezone.utc).strftime("%d.%m.%Y %H:%M UTC")
 
 
-def button(text, data):
-    return InlineKeyboardButton(text=text, callback_data=data)
+def button(text, data, style=None):
+    return themed_button(text, data, style=style)
 
 
 def consent_keyboard():
@@ -414,10 +419,14 @@ def smart_allowed(uid, state):
 
 
 def menu_keyboard(mode="soft", pro=False, uid=None):
-    rows = [[button(("✓ " if key == mode else "") + MODE_NAMES[key] +
+    labels = {"soft": "☁ Chill", "smart": "✦ Smart", "raw": "⚡ Raw"}
+    rows = [[button(("● " if key == mode else "") + labels[key] +
                     (" 🔒" if key == "smart" and not smart_allowed(uid, {"pro": pro}) else ""),
-                    "mode:" + key) for key in ("soft", "smart", "raw")]]
-    rows.append([button("💠 Мой Plus · продлить" if pro else f"💠 Plus · 7 дней за {billing.PRICE} ⭐", "ui:pro")])
+                    "mode:" + key, style="primary" if key == mode else None)
+             for key in ("soft", "smart", "raw")]]
+    if mode == "smart":
+        rows.append([button("🎨 Create image", "ui:image")])
+    rows.append([button("✦ My Plus · renew" if pro else f"✦ GOSHA PLUS · {billing.PRICE} ⭐ / 7 days", "ui:pro", style="success")])
     if OWNER_ID > 0 and uid == OWNER_ID:
         rows.append([button("🛠 Меню бота", "admin:users:0")])
     rows.append([button("❔ Как общаться", "ui:help"), button("🔒 О данных", "ui:privacy")])
@@ -435,7 +444,7 @@ WELCOME = (
     "<b>ГОША · коротко и в лицо</b>\n\n"
     "😌 Мягко — без мата и личных оскорблений.\n"
     "💀 Без фильтров — самая резкая словесная перепалка.\n"
-    "🧠 Умный — задачи и объяснения · Plus, 5 ответов/час.\n\n"
+    "🧠 Smart — задачи, фото и картинки · Plus, 5 запросов/час.\n\n"
     "<b>16+</b> · Это ИИ-персонаж. Продолжая, соглашаешься на выбранный "
     "стиль и обработку сообщений: текст передаётся OpenRouter и провайдеру.\n"
     "Не хочешь ругани — сразу выбирай «Мягко»."
@@ -449,7 +458,7 @@ PRIVACY_DETAILS = (
     "Активный оплаченный доступ, записи платежей, временные антиспам-счётчики сохраняются. "
     "Старый дневной счётчик предыдущей версии очищается после смены дня UTC.\n\n"
     "Это не удаляет копии у Telegram и провайдеров. Самоподтверждение 16+ не заменяет "
-    "проверку документов. По данным и платежам: кнопка «Поддержка» или /support. Обращения и вложения получает владелец; они не отправляются ИИ. В базе сохраняются только номера обращений и маршруты ответов до 30 дней; копии переписки остаются в Telegram."
+    "проверку документов. По данным и платежам: кнопка «Поддержка» или /support. Обращения и вложения получает владелец; они не отправляются ИИ. Для создания картинки описание также передаётся OpenRouter и модели; изображение в базе не сохраняется. В базе сохраняются только номера обращений и маршруты ответов до 30 дней; копии переписки остаются в Telegram."
 )
 TERMS = (
     "<b>📜 Условия Plus</b>\n\n"
@@ -458,7 +467,7 @@ TERMS = (
     "Повторная покупка добавляет 7 дней к действующему сроку.\n"
     f"∞ На этот срок снимается бесплатная квота {billing.FREE_LIMIT} запросов/час. "
     f"Пауза {COOLDOWN} с, ограничения длины и защита от перегрузки остаются.\n"
-    "🧠 На время Plus открывается режим «Умный» с отдельной моделью: 5 успешных ответов за скользящие 60 минут. Ошибки генерации не списываются.\n"
+    "🧠 На время Plus открывается режим «Умный» с отдельной моделью: 5 успешных ответов за скользящие 60 минут. Ошибки генерации не списываются. Создание одной картинки по тексту использует один запрос из этого же лимита.\n"
     "🔁 Разовый платёж, <b>без автопродления</b>.\n\n"
     "Оплачивается доступ к ИИ-боту, а не гарантированная формулировка каждого ответа. "
     "Сервисы Telegram и модели могут быть временно недоступны. "
@@ -488,6 +497,7 @@ HELP_DETAILS = (
     "Один разбор фото — один запрос из лимита 5/час. Фото до 10 МБ. "
     "Не обрезай условие и рисунок; плохо читаемые места Гоша попросит уточнить. "
     "Для повторного просмотра деталей отправь фото снова.\n"
+    "\n🎨 В Smart напиши «Нарисуй …» или /image и описание. Готовая картинка — один запрос из общего лимита 5/час. Редактирование фото не подключено.\n"
     f"Пауза между запросами: {COOLDOWN} с."
 )
 
@@ -497,6 +507,7 @@ PRIVACY = (
     "• Текст, фото задачи и до 24 прошлых сообщений передаются OpenRouter и провайдеру ИИ.\n"
     "• Фото не хранятся в базе бота; текст и ответы сохраняются. Не присылай секреты.\n"
     "• /reset — забыть диалог; /delete — удалить также настройки и согласие. Платежи, оплаченный доступ и временные счётчики сохраняются.\n"
+    "• Описания для картинок тоже передаются OpenRouter и модели; созданные изображения в базе не хранятся.\n"
     "• Поддержку читает владелец, не ИИ. /delete удаляет номера обращений в базе, но не копии в Telegram и у провайдеров."
 )
 HELP = (
@@ -504,9 +515,10 @@ HELP = (
     "Просто напиши Гоше — команды не нужны.\n\n"
     "😌 <b>Мягко</b> — спокойно, без мата.\n"
     "💀 <b>Без фильтров</b> — добровольная резкая перепалка.\n"
-    "🧠 <b>Умный</b> — задачи, фото и объяснения; Plus, 5 ответов/час.\n\n"
+    "✦ <b>Smart</b> — задачи, фото, объяснения и создание картинок; Plus, 5 запросов/час.\n\n"
     f"Бесплатно — {billing.FREE_LIMIT} ответов за скользящий час.\n"
     "Фото задачи отправляй в «Умном»: чётко, целиком, до 10 МБ.\n"
+    "🎨 Для картинки напиши в Smart: «Нарисуй …». Одна картинка — один запрос.\n"
     "/reset — начать диалог заново. Если что-то не работает — жми «Поддержка»."
 )
 
@@ -612,7 +624,7 @@ async def show_pro(message, uid):
         current = "\n👑 <b>У Owner уже нет квоты и паузы. Покупка для себя не требуется.</b>\n"
     text = (
         "<b>💠 ГОША PLUS</b>\n" + role_line(uid, state) + "\n\n"
-        f"∞ Обычные режимы — без почасовой квоты\n🧠 Умный — {billing.SMART_LIMIT} ответов/час\n🗓 7 дней доступа\n💫 Всего {billing.PRICE} ⭐ (Telegram Stars)\n"
+        f"∞ Обычные режимы — без почасовой квоты\n✦ Smart — {billing.SMART_LIMIT} запросов/час, включая картинки\n🗓 7 дней доступа\n💫 Всего {billing.PRICE} ⭐ (Telegram Stars)\n"
         "🔁 Без автосписаний\n" + current +
         f"\nПауза {COOLDOWN} с и защита от перегрузки остаются для обычного Plus. "
         "Повторная покупка продлевает срок на 7 дней.\n\n"
@@ -623,7 +635,7 @@ async def show_pro(message, uid):
     if payments_ready():
         payload = "gl_" + secrets.token_urlsafe(24)
         await bill("create_order", uid, {'payload': payload, 'merchant_id': PAYMENT_BOT.id, 'kind': 'link'})
-        rows.append([InlineKeyboardButton(text=f"Оплатить ⭐ {billing.PRICE}", url=f"https://t.me/{PAYMENT_USERNAME}?start={payload}")])
+        rows.append([InlineKeyboardButton(text=f"✦ Оплатить Plus · {billing.PRICE} ⭐", style="success", url=f"https://t.me/{PAYMENT_USERNAME}?start={payload}")])
     else:
         if OWNER_ID > 0 and uid == OWNER_ID:
             text += "\n\n⚙️ Есть ошибка настройки оплаты. Нажми кнопку диагностики ниже."
@@ -871,8 +883,8 @@ async def create_invoice(message, uid, link_payload=None):
             prices=[LabeledPrice(label="Plus · 7 дней", amount=billing.PRICE)],
             start_parameter="gosha-plus",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text=f"Заплатить ⭐ {billing.PRICE}", pay=True)],
-                [InlineKeyboardButton(text="Прочитать условия", url=f"https://t.me/{MAIN_USERNAME}?start=terms")]
+                [InlineKeyboardButton(text=f"✦ Pay · {billing.PRICE} ⭐", pay=True, style="success")],
+                [InlineKeyboardButton(text="≡ Terms", url=f"https://t.me/{MAIN_USERNAME}?start=terms")]
             ]),
         )
     except TelegramAPIError:
@@ -942,13 +954,80 @@ def smart_reply(text, finish_reason=None):
     return text
 
 
-async def generate(message, uid, text, photo=None):
-    global in_flight
+async def generate_picture(message, uid, prompt):
+    progress = await message.answer("🎨 GOSHA STUDIO\nСоздаю картинку по твоему описанию… Это может занять до трёх минут.")
+    delivered = False
+    try:
+        raw, filename = await asyncio.wait_for(imagegen.create_image(prompt, OPENROUTER_API_KEY, IMAGE_MODEL),
+                                               timeout=imagegen.TIMEOUT + 5)
+        await message.bot.send_chat_action(message.chat.id, ChatAction.UPLOAD_PHOTO)
+        await message.answer_photo(BufferedInputFile(raw, filename=filename),
+                                   caption="🎨 GOSHA STUDIO · готово", parse_mode=None)
+        delivered = True
+        # Never persist raw generated image bytes or API response data.
+        await store("save", uid, ("[Запрос картинки] " + prompt, "[Создана и отправлена картинка по запросу.]"))
+        return True
+    except imagegen.ImageError as exc:
+        logging.warning("Image generation failed: model=%s kind=%s status=%s", IMAGE_MODEL, exc.kind, exc.status)
+        if exc.kind == "configuration":
+            await message.answer("🎨 Генерация пока недоступна. Владельцу нужно проверить доступ к модели и баланс OpenRouter. Запрос из лимита не списан.")
+        else:
+            await message.answer("🎨 Не удалось создать картинку. Попробуй другое описание или повтори позже. Запрос из лимита не списан.")
+        return False
+    except (TelegramAPIError, asyncio.TimeoutError) as exc:
+        logging.warning("Image request/delivery failed: type=%s", type(exc).__name__)
+        if not delivered:
+            await message.answer("🎨 Не удалось создать или доставить картинку. Попробуй позже. Запрос из лимита не списан.")
+        return delivered
+    finally:
+        try:
+            await progress.delete()
+        except (TelegramAPIError, AttributeError):
+            pass
+
+
+async def image_prompt(message, uid):
+    if not await consent(message, uid):
+        return
+    state = await bill("status", uid)
+    if not smart_allowed(uid, state):
+        await smart_paywall(message)
+        return
+    await store("mode", uid, "smart")
+    await message.answer("🎨 GOSHA STUDIO\n\nНапиши: «Нарисуй …» и опиши, что хочешь увидеть.\nНапример: «Нарисуй кота-космонавта в стиле комикса».\n\nОдна готовая картинка = один запрос из общего лимита Smart (5/час). Пока доступно создание по тексту, без изменения фото.",
+                         reply_markup=menu_keyboard("smart", state["pro"], uid))
+
+
+@router.message(Command("image", "draw"))
+async def image_handler(message: Message):
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) == 1:
+        await image_prompt(message, message.from_user.id)
+        return
+    await generate(message, message.from_user.id, parts[1], image_requested=True)
+
+
+async def generate(message, uid, text, photo=None, image_requested=False):
+    global in_flight, image_in_flight
     row = await consent(message, uid)
     if not row:
         return
     mode = row[1] if row[1] in ALL_MODES else "soft"
     is_smart = mode == "smart"
+    want_image = image_requested or imagegen.is_image_request(text)
+    if want_image and not is_smart:
+        await message.answer("🎨 Картинки создаются в Smart · Plus. Выбери «✦ Smart» и напиши, например: «Нарисуй кота-космонавта».",
+                             reply_markup=menu_keyboard(mode, (await bill("status", uid))["pro"], uid))
+        return
+    if want_image and photo is not None:
+        await message.answer("🎨 Пока создаю картинки по текстовому описанию, без редактирования фото. Пришли отдельное сообщение «Нарисуй …». Запрос не списан.")
+        return
+    if want_image and len(text) > imagegen.MAX_PROMPT_CHARS:
+        await message.answer(f"Сократи описание картинки до {imagegen.MAX_PROMPT_CHARS} символов. Запрос не списан.")
+        return
+    if want_image and image_in_flight >= MAX_IMAGE_CONCURRENT:
+        await message.answer("🎨 Студия занята. Попробуй чуть позже — запрос не списан.")
+        return
     if photo is not None and not is_smart:
         state = await bill("status", uid)
         await message.answer("📸 Фото задач разбираю в режиме «🧠 Умный». Выбери его в /menu и пришли фото ещё раз.",
@@ -965,6 +1044,8 @@ async def generate(message, uid, text, photo=None):
         await message.answer("Перегрузка. Попробуй чуть позже — запрос не списан.")
         return
     in_flight += 1
+    if want_image:
+        image_in_flight += 1
     reservation = None
     delivered = False
     try:
@@ -987,6 +1068,9 @@ async def generate(message, uid, text, photo=None):
                 await message.answer(f"Пауза между запросами — {COOLDOWN} с.")
             return
         reservation = permit['reservation']
+        if want_image:
+            delivered = await generate_picture(message, uid, text)
+            return
         photo_data_url = None
         if photo is not None:
             try:
@@ -1048,6 +1132,8 @@ async def generate(message, uid, text, photo=None):
         await store("save", uid, (history_text, answer))
     finally:
         in_flight -= 1
+        if want_image:
+            image_in_flight -= 1
         if reservation is not None and not delivered:
             await bill("release", uid, reservation)
 
@@ -1257,6 +1343,8 @@ async def ui_callback(query: CallbackQuery):
         await show_menu(message, uid)
     elif action == "pro":
         await show_pro(message, uid)
+    elif action == "image":
+        await image_prompt(message, uid)
     elif action in ("privacy", "privacy_details", "terms", "help", "help_details"):
         await show_info(message, action)
     elif action == "paymentstatus":
@@ -1441,7 +1529,7 @@ def backup_before_price_restore():
     if not folder.resolve().is_relative_to(Path(VOLUME_PATH).resolve()):
         raise RuntimeError("Backup directory must stay inside Railway Volume")
     folder.mkdir(parents=True, exist_ok=True, mode=0o700)
-    target = folder / (source.name + ".before-support-v13.sqlite3")
+    target = folder / (source.name + ".before-studio-v14.sqlite3")
 
     def verify(path):
         if path.is_symlink():
@@ -1516,6 +1604,7 @@ async def main():
             BotCommand(command="soft", description="😌 Без мата"),
             BotCommand(command="raw", description="💀 Без фильтров"),
             BotCommand(command="smart", description="🧠 Умный · Plus"),
+            BotCommand(command="image", description="🎨 Создать картинку · Smart"),
             BotCommand(command="help", description="❔ Как общаться"),
             BotCommand(command="terms", description="📜 Условия Plus"),
             BotCommand(command="support", description="🛟 Поддержка"),
@@ -1529,7 +1618,7 @@ async def main():
                 BotCommand(command="terms", description="📜 Условия"),
                 BotCommand(command="paysupport", description="🛟 Помощь с покупкой"),
             ])
-        logging.warning("Gosha v13 support started; bots=%s payments=%s owner_has_no_quota=True", len(bots), payments_ready())
+        logging.warning("Gosha v14 studio started; bots=%s payments=%s owner_has_no_quota=True", len(bots), payments_ready())
         if not payments_ready():
             logging.warning("Payment setup checks failed: %s", ", ".join(name for name, ok, _ in payment_checks() if not ok))
         await dp.start_polling(*bots, allowed_updates=["message", "callback_query", "pre_checkout_query"])

@@ -6,18 +6,19 @@ import sqlite3
 import time
 from contextlib import closing
 from html import escape
+from ui import button as ui_button
 
 from aiogram import BaseMiddleware
 from aiogram.enums import ChatType
 from aiogram.exceptions import TelegramAPIError
-from aiogram.types import Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, ReplyParameters
 
 TOPICS = {'pay': 'Оплата и Plus', 'data': 'Данные', 'bug': 'Ошибка бота', 'other': 'Другой вопрос'}
 
 
 def keyboard(*rows):
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=t, callback_data=d) for t, d in row] for row in rows])
+        [ui_button(t,d) for t, d in row] for row in rows])
 
 
 def home():
@@ -122,6 +123,9 @@ class Support:
             await message.answer('Поддержка пока не настроена. Попробуй позже.')
             return
         await self.call('clear',bid=message.bot.id,uid=uid)
+        if uid==self.owner() and topic is None:
+            await self.listing(message,uid)
+            return
         if topic:
             await self.compose(message,uid,topic)
         else:
@@ -148,7 +152,7 @@ class Support:
         rows,page,pages=await self.call('list',bid=message.bot.id,uid=uid,page=page)
         buttons=[]
         for r in rows:
-            title=f"#{r['id']} · {TOPICS.get(r['topic'],'Вопрос')} · "+('открыто' if r['status']=='open' else 'закрыто')
+            title=f"#{r['id']:04d} · {r['user_id']} · {TOPICS.get(r['topic'],'Вопрос')}"+(' ✓' if r['status']!='open' else '')
             buttons.append([(title,'sup:view:'+str(r['id']))])
         nav=[]
         if page:nav.append(('←','sup:list:'+str(page-1)))
@@ -159,9 +163,59 @@ class Support:
                              f' · {page+1}/{pages}\n\n'+('Выбери обращение. Сообщения находятся выше в чате.' if rows else 'Пока пусто.'),reply_markup=keyboard(*buttons))
 
     def actions(self,tid,owner=False):
-        return keyboard([('✍️ Ответить' if owner else '✍️ Дополнить',f'sup:reply:{tid}')],
-                        [('✅ Закрыть обращение',f'sup:close:{tid}')],
-                        [('← Выйти из поддержки','sup:exit')])
+        if owner:
+            return keyboard([(f'↗ Reply · #{tid:04d}',f'sup:reply:{tid}'),
+                             ('✓ Resolve',f'sup:close:{tid}')],
+                            [('≡ Inbox','sup:list:0')])
+        return keyboard([('＋ Add details',f'sup:reply:{tid}'),('✓ Done',f'sup:close:{tid}')],
+                        [('← Back to Gosha','sup:exit')])
+
+    @staticmethod
+    def chunks(text,limit=2800):
+        # Telegram limits are in UTF-16 code units, not Python code points.
+        buf=[];units=0
+        for char in text:
+            width=2 if ord(char)>65535 else 1
+            if units+width>limit:
+                yield ''.join(buf);buf=[];units=0
+            buf.append(char);units+=width
+        if buf:yield ''.join(buf)
+
+    async def deliver(self,m,t,target,is_owner,override=None,is_new=False):
+        tid=t['id'];kb=self.actions(tid,not is_owner)
+        if is_owner:
+            header=f"<b>✉ SUPPORT · #{tid:04d}</b>\nОтвет по твоему обращению"
+        else:
+            name=(getattr(m.from_user,'full_name','') or str(m.from_user.id))[:100]
+            state='NEW' if is_new else 'UPDATE'
+            header=(f"<b>✉ TICKET #{tid:04d} · {state}</b>\n"
+                    f"<b>Тема:</b> {escape(TOPICS.get(t['topic'],'Вопрос'))}\n"
+                    f"<b>От:</b> {escape(name)} · <code>{m.from_user.id}</code>")
+        async def remember(sent):
+            await self.call('link',bid=m.bot.id,uid=target,mid=sent.message_id,tid=tid)
+            return sent
+        async def card(text):
+            return await remember(await m.bot.send_message(target,header+'\n\n<blockquote>'+escape(text)+'</blockquote>',
+                                                        parse_mode='HTML',reply_markup=kb))
+        text=override if override is not None else getattr(m,'text',None)
+        if text is not None:
+            for part in self.chunks(text):await card(part)
+            return
+        # Media and its identifying caption/buttons travel as ONE Telegram message.
+        caption=getattr(m,'caption',None) or ''
+        can_caption=any(getattr(m,k,None) for k in ('photo','document','video','animation','audio','voice'))
+        if can_caption:
+            header_units=len(__import__('re').sub('<[^>]+>','',header).encode('utf-16-le'))//2
+            parts=list(self.chunks(caption,max(100,900-header_units))) if caption else []
+            cap=header+('\n\n'+escape(parts[0]) if parts else '\n\n📎 Вложение')
+            await remember(await m.bot.copy_message(chat_id=target,from_chat_id=m.chat.id,message_id=m.message_id,
+                                                   caption=cap,parse_mode='HTML',reply_markup=kb))
+            for part in parts[1:]:await card('Продолжение подписи:\n'+part)
+        else:
+            # Stickers/video notes have no caption field: visually thread the attachment.
+            h=await remember(await m.bot.send_message(target,header+'\n\n📎 Вложение ниже',parse_mode='HTML',reply_markup=kb))
+            await remember(await m.bot.copy_message(chat_id=target,from_chat_id=m.chat.id,message_id=m.message_id,
+                                                   reply_parameters=ReplyParameters(message_id=h.message_id)))
 
     async def callback(self,q):
         m,uid,bid=q.message,q.from_user.id,q.message.bot.id
@@ -178,19 +232,20 @@ class Support:
             if not t or uid not in (self.owner(),t['user_id']):
                 await m.answer('Обращение недоступно.');return
             if act=='view':
-                await m.answer(f"🛟 Обращение #{t['id']} · {TOPICS.get(t['topic'],'Вопрос')}\n"+
+                await m.answer(f"✉ TICKET #{t['id']:04d} · {TOPICS.get(t['topic'],'Вопрос')}\nПользователь: {t['user_id']}\n"+
                                ('Открыто' if t['status']=='open' else 'Закрыто'),
                                reply_markup=self.actions(t['id'],uid==self.owner()) if t['status']=='open' else home())
             elif t['status']!='open':await m.answer('Обращение уже закрыто.',reply_markup=home())
             elif act=='reply':
                 await self.call('set',bid=bid,uid=uid,kind='reply' if uid==self.owner() else 'ticket',target=t['id'])
-                await m.answer(f"✍️ Напиши {'ответ' if uid==self.owner() else 'дополнение'} к обращению #{t['id']}. Можно прислать фото или документ.",reply_markup=keyboard([('Отмена','sup:exit')]))
+                prompt=await m.answer(f"✍️ {'ОТВЕТ' if uid==self.owner() else 'ДОПОЛНЕНИЕ'} · #{t['id']:04d}\nКому: {t['user_id'] if uid==self.owner() else 'поддержка'}\nТема: {TOPICS.get(t['topic'],'Вопрос')}\n\nСледующее сообщение будет отправлено в это обращение. Можно приложить фото.",reply_markup=keyboard([('Отмена','sup:exit')]))
+                await self.call('link',bid=bid,uid=uid,mid=prompt.message_id,tid=t['id'])
             elif act=='close':
                 await self.call('close',bid=bid,tid=t['id'])
-                await m.answer(f"✅ Обращение #{t['id']} закрыто.",reply_markup=home())
+                await m.answer(f"✓ RESOLVED · #{t['id']:04d}",reply_markup=keyboard([('≡ Inbox','sup:list:0')]) if uid==self.owner() else home())
                 recipient=t['user_id'] if uid==self.owner() else self.owner()
                 if recipient!=uid:
-                    try:await m.bot.send_message(recipient,f"✅ Обращение #{t['id']} закрыто.",reply_markup=home())
+                    try:await m.bot.send_message(recipient,f"✓ RESOLVED · #{t['id']:04d}",reply_markup=keyboard([('≡ Inbox','sup:list:0')]) if recipient==self.owner() else home())
                     except TelegramAPIError:pass
 
     async def consume(self,m,override=None):
@@ -226,27 +281,18 @@ class Support:
         if t['status']!='open':
             await self.call('clear',bid=bid,uid=uid);await m.answer('Обращение уже закрыто. Создай новый вопрос.',reply_markup=home());return True
         target=t['user_id'] if is_owner else self.owner()
-        name=getattr(m.from_user,'full_name','') or str(uid)
-        header=(f"🛟 Ответ поддержки · #{tid}" if is_owner else
-                f"🛟 Обращение #{tid} · {TOPICS.get(t['topic'],'Вопрос')}\n{name[:100]} · ID {uid}\nОтветь на это сообщение или нажми «Ответить».")
         try:
-            h=await m.bot.send_message(target,header,parse_mode=None,reply_markup=self.actions(tid,not is_owner))
-            await self.call('link',bid=bid,uid=target,mid=h.message_id,tid=tid)
-            if override is not None:
-                out=await m.bot.send_message(target,override,parse_mode=None)
-            else:
-                out=await m.bot.copy_message(chat_id=target,from_chat_id=m.chat.id,message_id=m.message_id)
-            await self.call('link',bid=bid,uid=target,mid=out.message_id,tid=tid)
+            await self.deliver(m,t,target,is_owner,override,is_new=state['kind']=='compose')
         except TelegramAPIError:
-            await m.answer('Не удалось доставить сообщение. Оно не отправлено целиком. Попробуй ещё раз. Владелец должен открыть /start в этом боте, а получатель — не блокировать его.',reply_markup=self.actions(tid,is_owner))
+            await m.answer('Не удалось доставить сообщение целиком. Попробуй ещё раз. Владелец должен открыть /start в этом боте, а получатель — не блокировать его.',reply_markup=self.actions(tid,is_owner))
             return True
         await self.call('mark',bid=bid,uid=uid,mid=m.message_id,tid=tid)
         if is_owner:
             await self.call('clear',bid=bid,uid=uid)
-            await m.answer(f'✅ Ответ по #{tid} доставлен.',reply_markup=self.actions(tid,True))
+            await m.answer(f"✓ SENT · #{tid:04d}\nОтвет доставлен пользователю {t['user_id']}.",reply_markup=self.actions(tid,True))
         else:
             await self.call('set',bid=bid,uid=uid,kind='ticket',target=tid)
-            ack=await m.answer(f'✅ Отправлено в поддержку · #{tid}. Ответ придёт сюда.\nМожешь дописать детали. Чтобы снова общаться с Гошей, выйди из поддержки.',reply_markup=self.actions(tid))
+            ack=await m.answer(f'✓ Отправлено · #{tid:04d}\nОтвет придёт сюда. Можешь дописать детали или нажать Back to Gosha.',reply_markup=self.actions(tid))
             await self.call('link',bid=bid,uid=uid,mid=ack.message_id,tid=tid)
         return True
 
