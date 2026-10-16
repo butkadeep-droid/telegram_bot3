@@ -187,6 +187,44 @@ SMART_SYSTEM = """Ты — Гоша, вымышленный ИИ-друг с х�
 """
 
 
+IDENTITY_REPLY = "Я Гоша — ИИ-модель и собеседник с характером."
+IDENTITY_RULE = (
+    'Самоописание: на вопросы «кто ты», «какая ты модель», о названии своей '
+    'модели или нейросети отвечай единой фразой: «' + IDENTITY_REPLY + '». '
+    'Это исключение из матерного стиля: без ругани и перечисления поставщиков. '
+    'Не выдумывай разработчиков, версию или собственную базовую архитектуру. '
+    'Если рядом есть содержательный вопрос, после представления ответь и на него.'
+)
+SYSTEM += "\n" + IDENTITY_RULE
+SMART_SYSTEM += "\n" + IDENTITY_RULE
+
+_IDENTITY_PATTERNS = tuple(re.compile(p) for p in (
+    r"^(?:какую|чью) (?:модель|нейросеть) (?:ты )?(?:используешь|используете|представляешь)\b",
+    r"^у тебя (?:какая|какой) (?:ии )?(?:модель|нейросеть|нейронка)\b",
+    r"^какая у тебя (?:базовая|основная|языковая) модель\b",
+    r"^что ты за (?:модель|нейросеть|нейронка|ии)\b",
+    r"^(?:какая|какой|что за) (?:ты|у тебя) (?:ии )?(?:модель|нейросеть|нейронка|ии)\b",
+    r"^(?:ты )?(?:какая|какой) (?:ии )?(?:модель|нейросеть|нейронка)(?: ты)?$",
+    r"^на (?:какой|чьей) (?:модели|нейросети|нейронке) (?:ты )?(?:работаешь|основан|построен|сделан)\b",
+    r"^(?:ты )?на какой (?:ты )?модели(?: работаешь)?(?: ты)?$",
+    r"^(?:(?:назови|скажи) )?(?:свою|твою) (?:модель|нейросеть)\b",
+    r"^(?:какое|назови|скажи) (?:у тебя )?(?:название|имя) (?:твоей )?(?:модели|нейросети)\b",
+    r"^какая (?:у тебя )?(?:базовая|основная|языковая) модель\b",
+    r"^(?:как тебя зовут|как ты называешься|кто ты(?: такой)?|ты кто|представься)\b",
+    r"^ты (?:(?:точно|разве|случайно|это|не) )?(?:gemini|джемини|гемини|аргон|argon|chatgpt|чатгпт|gpt|джипити|deepseek|дипсик|claude|клод|нейросеть|ии|бот)\b",
+    r"^(?:what (?:ai )?model are you|what ai are you|who are you|are you (?:gemini|chatgpt|gpt|claude|deepseek))\b",
+))
+
+
+def is_identity_question(text):
+    text = re.sub(r"[\s.,!?;:…«»\"'()—–-]+", " ", (text or "").casefold().replace("ё", "е")).strip()
+    text = re.sub(r"^(?:(?:скажи честно|скажи пожалуйста|привет|здравствуй|слушай|скажи|пожалуйста|гоша|а|ну|вообще|честно) )+", "", text)
+    # Mixed task requests go to the model: do not silently throw away the user's task.
+    if re.search(r"\b(?:реши|посчитай|переведи|напиши|объясни|помоги|solve|calculate|translate|explain)\b", text):
+        return False
+    return any(p.search(text) for p in _IDENTITY_PATTERNS)
+
+
 def db_init():
     DB.parent.mkdir(parents=True, exist_ok=True)
     with closing(sqlite3.connect(DB, timeout=10)) as con, con:
@@ -1058,6 +1096,9 @@ async def generate(message, uid, text, photo=None, image_requested=False):
     row = await consent(message, uid)
     if not row:
         return
+    if photo is None and not image_requested and is_identity_question(text):
+        await message.answer(IDENTITY_REPLY, parse_mode=None)
+        return
     mode = row[1] if row[1] in ALL_MODES else "soft"
     is_smart = mode == "smart"
     if image_requested or disabled_image_request(text):
@@ -1708,7 +1749,7 @@ async def main():
                 BotCommand(command="terms", description="📜 Условия"),
                 BotCommand(command="paysupport", description="🛟 Помощь с покупкой"),
             ])
-        logging.warning("Gosha v21 Gemini 4 Argon and permanent mode styles; bots=%s payments=%s owner_has_no_quota=True", len(bots), payments_ready())
+        logging.warning("Gosha v22 fixed Gosha identity; bots=%s payments=%s owner_has_no_quota=True", len(bots), payments_ready())
         if not payments_ready():
             logging.warning("Payment setup checks failed: %s", ", ".join(name for name, ok, _ in payment_checks() if not ok))
         await dp.start_polling(*bots, allowed_updates=["message", "callback_query", "pre_checkout_query"])
