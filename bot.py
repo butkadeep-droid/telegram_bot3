@@ -533,6 +533,169 @@ pay_router.message.outer_middleware(SupportMiddleware(support_service))
 pay_router.callback_query.outer_middleware(SupportMiddleware(support_service))
 
 
+CHANNEL_USERNAME = "@Gosha_Ai_Channel"
+CHANNEL_URL = "https://t.me/Gosha_Ai_Channel"
+CHANNEL_GATE_TITLE = "📣 Подпишись на канал Гоши"
+_CHANNEL_ADMIN_UNTIL = {}
+_CHANNEL_RETRY_UNTIL = {}
+_CHANNEL_SCREENS = {}
+
+
+def subscription_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📲 Подписаться на канал", url=CHANNEL_URL)],
+        [button("✅ Проверить подписку", "channel:check")],
+    ])
+
+
+def channel_member_active(member):
+    status = getattr(member, "status", "")
+    return (status in ("member", "administrator", "creator")
+            or (status == "restricted" and getattr(member, "is_member", False) is True))
+
+
+async def channel_subscription_state(merchant, uid):
+    """True=joined, False=not joined, None=check unavailable. No member cache."""
+    if merchant is None or not isinstance(uid, int) or uid <= 0:
+        return None
+    bot_id = merchant.id
+    now = time.monotonic()
+    if now < _CHANNEL_RETRY_UNTIL.get(bot_id, 0):
+        return None
+    try:
+        if now >= _CHANNEL_ADMIN_UNTIL.get(bot_id, 0):
+            own = await merchant.get_chat_member(chat_id=CHANNEL_USERNAME, user_id=bot_id, request_timeout=10)
+            if own.status not in ("administrator", "creator"):
+                logging.warning("Channel subscription unavailable: main bot must be channel administrator")
+                _CHANNEL_RETRY_UNTIL[bot_id] = now + 30
+                return None
+            _CHANNEL_ADMIN_UNTIL[bot_id] = now + 60
+        member = await merchant.get_chat_member(chat_id=CHANNEL_USERNAME, user_id=uid, request_timeout=10)
+        return channel_member_active(member)
+    except TelegramRetryAfter as exc:
+        _CHANNEL_RETRY_UNTIL[bot_id] = time.monotonic() + max(1, exc.retry_after) + 1
+        logging.warning("Channel subscription retry: wait=%s", max(1, exc.retry_after)+1)
+    except (TelegramAPIError, OSError, asyncio.TimeoutError) as exc:
+        _CHANNEL_ADMIN_UNTIL.pop(bot_id, None)
+        _CHANNEL_RETRY_UNTIL[bot_id] = time.monotonic() + 10
+        logging.warning("Channel subscription check failed: type=%s reason=%s", type(exc).__name__, safe_telegram_reason(exc))
+    return None
+
+
+def channel_gate_text(state=False, checked=False):
+    body = (CHANNEL_GATE_TITLE + "\n\n"
+            "🔒 Чтобы пользоваться ботом, нужна подписка на наш ТГК.\n\n"
+            "Там — новости, обновления и анонсы 🫶\n"
+            "Подпишись и нажми «Проверить подписку» — открою доступ ✨")
+    if state is None:
+        body += "\n\n⚠️ Проверка сейчас недоступна. Попробуй чуть позже. Помощь: /support."
+    elif checked:
+        body += "\n\n🙈 Ты ещё не подписался на канал. Подпишись, затем нажми «Проверить подписку» — и откроется доступ."
+    return body
+
+
+async def show_channel_gate(message, uid, state=False, checked=False):
+    text = channel_gate_text(state, checked)
+    merchant = MAIN_BOT or message.bot
+    key = (merchant.id, uid)
+    now = time.monotonic()
+    # Retain only a small, short-lived set of our own navigation message IDs.
+    for old_key, (_, when) in list(_CHANNEL_SCREENS.items()):
+        if now-when > 1800:
+            _CHANNEL_SCREENS.pop(old_key, None)
+    if len(_CHANNEL_SCREENS) > 2000:
+        _CHANNEL_SCREENS.pop(next(iter(_CHANNEL_SCREENS)), None)
+    old = _CHANNEL_SCREENS.get(key)
+    if old:
+        try:
+            await merchant.edit_message_text(chat_id=uid, message_id=old[0], text=text,
+                                             parse_mode=None, reply_markup=subscription_keyboard())
+            _CHANNEL_SCREENS[key] = (old[0], now)
+            return
+        except TelegramBadRequest as exc:
+            if "message is not modified" in exc.message.lower():
+                _CHANNEL_SCREENS[key] = (old[0], now)
+                return
+        except TelegramAPIError:
+            pass
+    sent = await message.answer(text, parse_mode=None, reply_markup=subscription_keyboard())
+    mid = getattr(sent, "message_id", None)
+    if isinstance(mid, int) and mid > 0:
+        _CHANNEL_SCREENS[key] = (mid, now)
+
+
+class ChannelSubscriptionMiddleware(BaseMiddleware):
+    # Service, data controls, human support and financial records stay accessible.
+    safe_commands = frozenset({"support", "paysupport", "tickets", "privacy", "terms", "help",
+                               "myid", "role", "reset", "delete", "paymentstatus", "reply",
+                               "stars", "payments", "refund", "friend", "unfriend", "friends", "plus", "pro"})
+    safe_callbacks = frozenset({"channel:check", "payment:agree", "ui:pro", "pro:buy", "ui:support", "ui:privacy", "ui:privacy_details",
+                                "ui:terms", "ui:help", "ui:help_details", "ui:paymentstatus"})
+
+    async def __call__(self, handler, event, data):
+        if isinstance(event, Message):
+            if event.successful_payment or event.refunded_payment:
+                return await handler(event, data)
+            text = (event.text or "").strip()
+            if text.startswith("/"):
+                command = text.split()[0].split("@", 1)[0][1:].lower()
+                if command in self.safe_commands:
+                    return await handler(event, data)
+                # Purchase/deep-link entry points are never gated by channel membership.
+                parts = text.split(maxsplit=1)
+                if command == "start" and len(parts) == 2 and parts[1] in ("plus", "pro", "paid"):
+                    return await handler(event, data)
+            message = event
+        elif isinstance(event, CallbackQuery):
+            if event.data in self.safe_callbacks or (event.data or "").startswith(("sup:", "admin:")):
+                return await handler(event, data)
+            message = event.message
+            if message is None or not isinstance(message, Message):
+                return
+        else:
+            return await handler(event, data)
+        user = getattr(event, "from_user", None)
+        if user is None or user.is_bot:
+            return
+        # Always use Telegram's sender identity, never a UID supplied in callback data.
+        merchant = MAIN_BOT or data.get("bot") or message.bot
+        state = await channel_subscription_state(merchant, user.id)
+        if state is not True:
+            await show_channel_gate(message, user.id, state=state)
+            return
+        return await handler(event, data)
+
+
+channel_subscription = ChannelSubscriptionMiddleware()
+# Inner middleware runs after SupportMiddleware and filters; support conversations are not gated.
+router.message.middleware(channel_subscription)
+router.callback_query.middleware(channel_subscription)
+
+
+@router.callback_query(F.data == "channel:check")
+async def check_channel_callback(query: CallbackQuery):
+    uid = query.from_user.id
+    message = query.message
+    if message is None or message.chat.type != ChatType.PRIVATE or message.chat.id != uid:
+        return
+    state = await channel_subscription_state(MAIN_BOT or query.bot, uid)
+    if state is not True:
+        await show_channel_gate(message, uid, state=state, checked=True)
+        return
+    # Show the existing menu/16+ consent without granting consent or changing a paid role.
+    merchant = MAIN_BOT or query.bot
+    await support_service.call("clear", bid=merchant.id, uid=uid)
+    await show_menu(message, uid)
+    old = _CHANNEL_SCREENS.pop((merchant.id, uid), None)
+    if old and old[0] != message.message_id:
+        try:
+            await merchant.delete_message(chat_id=uid, message_id=old[0])
+        except TelegramAPIError:
+            pass
+    if (getattr(message, "text", "") or "").startswith(CHANNEL_GATE_TITLE):
+        await remove_navigation_screen(message, uid)
+
+
 async def bill(action, uid=0, value=None):
     return await asyncio.to_thread(billing.run, DB, action, uid, value)
 
@@ -618,6 +781,13 @@ def button(text, data, style=None):
 def consent_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
         [button("✅ Мне 16+ · принимаю дерзкий стиль", "ui:agree")],
+        [button("🔒 О данных", "ui:privacy"), button("📜 Условия", "ui:terms")],
+    ])
+
+
+def payment_consent_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [button("✅ Мне 16+ · принимаю стиль · к оплате", "payment:agree")],
         [button("🔒 О данных", "ui:privacy"), button("📜 Условия", "ui:terms")],
     ])
 
@@ -762,10 +932,10 @@ def compact_reply(text):
     return short.rstrip(" ,;:-.!?…") + "…"
 
 
-async def consent(message, uid):
+async def consent(message, uid, payment=False):
     row = await store("get", uid)
     if not row or not row[0]:
-        await message.answer("Сначала подтверди 16+ и выбранный дерзкий стиль 👇", reply_markup=consent_keyboard())
+        await message.answer("Сначала подтверди 16+ и выбранный дерзкий стиль 👇", reply_markup=payment_consent_keyboard() if payment else consent_keyboard())
         return None
     return row
 
@@ -873,7 +1043,7 @@ def main_bot_keyboard(pro=False):
 
 
 async def show_pro(message, uid):
-    if not await consent(message, uid):
+    if not await consent(message, uid, payment=True):
         return
     state = await bill("status", uid)
     current = f"\n✅ <b>Активен до {utc_date(state['until'])}</b>\n" if state['pro'] else ""
@@ -1676,6 +1846,15 @@ async def mode_callback(query: CallbackQuery):
     await show_menu(query.message, query.from_user.id, edit=True)
 
 
+@router.callback_query(F.data == "payment:agree")
+async def payment_consent_callback(query: CallbackQuery):
+    uid = query.from_user.id
+    if query.message is None or query.message.chat.type != ChatType.PRIVATE or query.message.chat.id != uid:
+        return
+    await store("agree", uid)
+    await show_pro(query.message, uid)
+
+
 @router.callback_query(F.data == "pro:buy")
 async def buy_callback(query: CallbackQuery):
     await show_pro(query.message, query.from_user.id)
@@ -2072,7 +2251,7 @@ async def main():
                 BotCommand(command="terms", description="📜 Условия"),
                 BotCommand(command="paysupport", description="🛟 Помощь с покупкой"),
             ])
-        logging.warning("Gosha v31 Friend role; bots=%s payments=%s owner_has_no_quota=True", len(bots), payments_ready())
+        logging.warning("Gosha v32 Friend and channel subscription; bots=%s payments=%s owner_has_no_quota=True", len(bots), payments_ready())
         if not payments_ready():
             logging.warning("Payment setup checks failed: %s", ", ".join(name for name, ok, _ in payment_checks() if not ok))
         await dp.start_polling(*bots, allowed_updates=["message", "callback_query", "pre_checkout_query"])
