@@ -501,13 +501,16 @@ class UserLockMiddleware(BaseMiddleware):
     async def __call__(self, handler, event, data):
         if isinstance(event, CallbackQuery):
             try:
-                await event.answer()
-            except TelegramAPIError:
+                await event.answer(request_timeout=3)
+            except (TelegramAPIError, OSError, asyncio.TimeoutError):
                 logging.warning("Callback acknowledgement failed")
         if isinstance(event, Message) and (event.successful_payment or event.refunded_payment):
             return await handler(event, data)
         user = getattr(event, "from_user", None)
         if user is None:
+            return await handler(event, data)
+        # Subscription verification must not queue behind a long model response.
+        if isinstance(event, CallbackQuery) and event.data == "channel:check":
             return await handler(event, data)
         entry = self.entries.setdefault(user.id, [asyncio.Lock(), 0])
         entry[1] += 1
@@ -539,6 +542,11 @@ CHANNEL_GATE_TITLE = "📣 Подпишись на канал Гоши"
 _CHANNEL_ADMIN_UNTIL = {}
 _CHANNEL_RETRY_UNTIL = {}
 _CHANNEL_SCREENS = {}
+_CHANNEL_MEMBERS = {}
+_CHANNEL_LAST_ERROR = {}
+_CHANNEL_BUTTON_BUSY = set()
+CHANNEL_MEMBER_TTL = 15
+CHANNEL_CHECK_TIMEOUT = 5
 
 
 def subscription_keyboard():
@@ -554,32 +562,89 @@ def channel_member_active(member):
             or (status == "restricted" and getattr(member, "is_member", False) is True))
 
 
-async def channel_subscription_state(merchant, uid):
-    """True=joined, False=not joined, None=check unavailable. No member cache."""
+async def channel_subscription_state(merchant, uid, force=False):
+    """Fresh button check; short positive cache for chat, invalidated on leave events."""
     if merchant is None or not isinstance(uid, int) or uid <= 0:
         return None
     bot_id = merchant.id
     now = time.monotonic()
+    key = (bot_id, uid)
+    # Real Telegram flood waits cannot be bypassed by repeated button presses.
     if now < _CHANNEL_RETRY_UNTIL.get(bot_id, 0):
         return None
-    try:
-        if now >= _CHANNEL_ADMIN_UNTIL.get(bot_id, 0):
-            own = await merchant.get_chat_member(chat_id=CHANNEL_USERNAME, user_id=bot_id, request_timeout=10)
+    if not force:
+        cached = _CHANNEL_MEMBERS.get(key)
+        if cached and now < cached:
+            return True
+    else:
+        _CHANNEL_MEMBERS.pop(key, None)
+    async def fetch():
+        if time.monotonic() >= _CHANNEL_ADMIN_UNTIL.get(bot_id, 0):
+            own = await merchant.get_chat_member(chat_id=CHANNEL_USERNAME, user_id=bot_id, request_timeout=3)
             if own.status not in ("administrator", "creator"):
+                _CHANNEL_LAST_ERROR[bot_id] = "Основной бот не администратор канала. Добавь именно основного бота администратором."
                 logging.warning("Channel subscription unavailable: main bot must be channel administrator")
-                _CHANNEL_RETRY_UNTIL[bot_id] = now + 30
                 return None
-            _CHANNEL_ADMIN_UNTIL[bot_id] = now + 60
-        member = await merchant.get_chat_member(chat_id=CHANNEL_USERNAME, user_id=uid, request_timeout=10)
+            _CHANNEL_ADMIN_UNTIL[bot_id] = time.monotonic() + 300
+        member = await merchant.get_chat_member(chat_id=CHANNEL_USERNAME, user_id=uid, request_timeout=3)
         return channel_member_active(member)
+    try:
+        state = await asyncio.wait_for(fetch(), timeout=CHANNEL_CHECK_TIMEOUT)
+        if state is not None:
+            _CHANNEL_LAST_ERROR.pop(bot_id, None)
+        if state is True:
+            if len(_CHANNEL_MEMBERS) > 5000:
+                for old_key, expires in list(_CHANNEL_MEMBERS.items()):
+                    if expires <= now:
+                        _CHANNEL_MEMBERS.pop(old_key, None)
+                if len(_CHANNEL_MEMBERS) > 5000:
+                    _CHANNEL_MEMBERS.pop(next(iter(_CHANNEL_MEMBERS)), None)
+            _CHANNEL_MEMBERS[key] = time.monotonic() + CHANNEL_MEMBER_TTL
+        else:
+            _CHANNEL_MEMBERS.pop(key, None)
+        return state
     except TelegramRetryAfter as exc:
-        _CHANNEL_RETRY_UNTIL[bot_id] = time.monotonic() + max(1, exc.retry_after) + 1
-        logging.warning("Channel subscription retry: wait=%s", max(1, exc.retry_after)+1)
+        wait = max(1, exc.retry_after) + 1
+        _CHANNEL_RETRY_UNTIL[bot_id] = time.monotonic() + wait
+        _CHANNEL_LAST_ERROR[bot_id] = f"Telegram ограничил проверки. Повтор примерно через {wait} с."
+        logging.warning("Channel subscription retry: wait=%s", wait)
     except (TelegramAPIError, OSError, asyncio.TimeoutError) as exc:
         _CHANNEL_ADMIN_UNTIL.pop(bot_id, None)
-        _CHANNEL_RETRY_UNTIL[bot_id] = time.monotonic() + 10
-        logging.warning("Channel subscription check failed: type=%s reason=%s", type(exc).__name__, safe_telegram_reason(exc))
+        # A transient error is NOT cached globally: the next button press retries immediately.
+        reason = "Telegram не ответил за 5 секунд." if isinstance(exc, asyncio.TimeoutError) else safe_telegram_reason(exc)
+        if "member list is inaccessible" in reason.casefold():
+            _CHANNEL_LAST_ERROR[bot_id] = (
+                "Telegram не даёт доступ к участникам канала. Добавь ОСНОВНОГО бота "
+                "администратором @Gosha_Ai_Channel, затем снова нажми проверку. "
+                "Права на публикацию постов не обязательны.")
+        elif "chat not found" in reason.casefold():
+            _CHANNEL_LAST_ERROR[bot_id] = "Канал не найден или недоступен основному боту. Проверь @Gosha_Ai_Channel и добавь бота в администраторы."
+        else:
+            _CHANNEL_LAST_ERROR[bot_id] = reason
+        logging.warning("Channel subscription check failed: type=%s reason=%s", type(exc).__name__, reason)
+    _CHANNEL_MEMBERS.pop(key, None)
     return None
+
+
+async def channel_membership_updated(event):
+    channel = event.chat
+    if (getattr(channel, "username", None) or "").casefold() != CHANNEL_USERNAME.lstrip("@").casefold():
+        return
+    merchant = event.bot
+    target = event.new_chat_member.user.id
+    _CHANNEL_MEMBERS.pop((merchant.id, target), None)
+    if target == merchant.id:
+        _CHANNEL_ADMIN_UNTIL.pop(merchant.id, None)
+        # Bot removal affects all cached members immediately.
+        for key in list(_CHANNEL_MEMBERS):
+            if key[0] == merchant.id:
+                _CHANNEL_MEMBERS.pop(key, None)
+
+
+router.chat_member.filter(BotRoleFilter())
+router.my_chat_member.filter(BotRoleFilter())
+router.chat_member.register(channel_membership_updated)
+router.my_chat_member.register(channel_membership_updated)
 
 
 def channel_gate_text(state=False, checked=False):
@@ -609,7 +674,7 @@ async def show_channel_gate(message, uid, state=False, checked=False):
     if old:
         try:
             await merchant.edit_message_text(chat_id=uid, message_id=old[0], text=text,
-                                             parse_mode=None, reply_markup=subscription_keyboard())
+                                             parse_mode=None, reply_markup=subscription_keyboard(), request_timeout=5)
             _CHANNEL_SCREENS[key] = (old[0], now)
             return
         except TelegramBadRequest as exc:
@@ -628,7 +693,7 @@ class ChannelSubscriptionMiddleware(BaseMiddleware):
     # Service, data controls, human support and financial records stay accessible.
     safe_commands = frozenset({"support", "paysupport", "tickets", "privacy", "terms", "help",
                                "myid", "role", "reset", "delete", "paymentstatus", "reply",
-                               "stars", "payments", "refund", "friend", "unfriend", "friends", "plus", "pro"})
+                               "stars", "payments", "refund", "friend", "unfriend", "friends", "plus", "pro", "channelstatus"})
     safe_callbacks = frozenset({"channel:check", "payment:agree", "ui:pro", "pro:buy", "ui:support", "ui:privacy", "ui:privacy_details",
                                 "ui:terms", "ui:help", "ui:help_details", "ui:paymentstatus"})
 
@@ -672,13 +737,41 @@ router.message.middleware(channel_subscription)
 router.callback_query.middleware(channel_subscription)
 
 
+@router.message(Command("channelstatus"))
+async def channel_status_handler(message: Message):
+    uid = message.from_user.id
+    if not owner_admin_allowed(message, uid):
+        await message.answer("Диагностика канала доступна только владельцу в личке.")
+        return
+    merchant = MAIN_BOT or message.bot
+    _CHANNEL_ADMIN_UNTIL.pop(merchant.id, None)
+    state = await channel_subscription_state(merchant, uid, force=True)
+    result = "✅ Проверка работает. Твоя подписка подтверждена." if state is True else "✅ Проверка работает, но твоя подписка не найдена." if state is False else "⚠️ Проверка недоступна."
+    detail = _CHANNEL_LAST_ERROR.get(merchant.id, "")
+    await message.answer("📣 Канал: " + CHANNEL_USERNAME + "\n" + result + ("\n" + detail if detail else ""), parse_mode=None)
+
+
 @router.callback_query(F.data == "channel:check")
 async def check_channel_callback(query: CallbackQuery):
+    if (not isinstance(query.message, Message) or query.message.chat.type != ChatType.PRIVATE
+            or query.message.chat.id != query.from_user.id):
+        return
+    key = ((MAIN_BOT or query.bot).id, query.from_user.id)
+    if key in _CHANNEL_BUTTON_BUSY:
+        return
+    _CHANNEL_BUTTON_BUSY.add(key)
+    try:
+        await _check_channel_callback(query)
+    finally:
+        _CHANNEL_BUTTON_BUSY.discard(key)
+
+
+async def _check_channel_callback(query: CallbackQuery):
     uid = query.from_user.id
     message = query.message
     if message is None or message.chat.type != ChatType.PRIVATE or message.chat.id != uid:
         return
-    state = await channel_subscription_state(MAIN_BOT or query.bot, uid)
+    state = await channel_subscription_state(MAIN_BOT or query.bot, uid, force=True)
     if state is not True:
         await show_channel_gate(message, uid, state=state, checked=True)
         return
@@ -2251,10 +2344,10 @@ async def main():
                 BotCommand(command="terms", description="📜 Условия"),
                 BotCommand(command="paysupport", description="🛟 Помощь с покупкой"),
             ])
-        logging.warning("Gosha v32 Friend and channel subscription; bots=%s payments=%s owner_has_no_quota=True", len(bots), payments_ready())
+        logging.warning("Gosha v33 fast channel checks; bots=%s payments=%s owner_has_no_quota=True", len(bots), payments_ready())
         if not payments_ready():
             logging.warning("Payment setup checks failed: %s", ", ".join(name for name, ok, _ in payment_checks() if not ok))
-        await dp.start_polling(*bots, allowed_updates=["message", "callback_query", "pre_checkout_query"])
+        await dp.start_polling(*bots, allowed_updates=["message", "callback_query", "pre_checkout_query", "chat_member", "my_chat_member"])
     finally:
         for task in tasks:
             task.cancel()
