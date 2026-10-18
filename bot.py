@@ -329,6 +329,9 @@ def db_init():
         con.execute("PRAGMA journal_mode=WAL")
         con.executescript("""
         CREATE TABLE IF NOT EXISTS bot_members (user_id INTEGER PRIMARY KEY, username TEXT);
+        CREATE TABLE IF NOT EXISTS friend_roles (
+            user_id INTEGER PRIMARY KEY, granted_by INTEGER NOT NULL, granted_at REAL NOT NULL
+        );
         CREATE TABLE IF NOT EXISTS bot_registry_state (key TEXT PRIMARY KEY, value TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS bot_assets (
             bot_id INTEGER PRIMARY KEY, avatar_hash TEXT NOT NULL
@@ -370,6 +373,22 @@ def db_run(action, uid=0, value=None):
     day = datetime.now(timezone.utc).date().isoformat()
     now = time.time()
     with closing(sqlite3.connect(DB, timeout=10)) as con, con:
+        if action in ("friend_grant", "friend_revoke", "friend_list"):
+            if OWNER_ID <= 0 or uid != OWNER_ID:
+                raise PermissionError("Owner only")
+            con.execute("BEGIN IMMEDIATE")
+            if action == "friend_list":
+                return con.execute("SELECT user_id FROM friend_roles ORDER BY user_id LIMIT 50").fetchall()
+            target = int(value)
+            if target <= 0 or target > 2**52-1 or target == OWNER_ID:
+                return "invalid"
+            if action == "friend_grant":
+                if not con.execute("SELECT 1 FROM bot_members WHERE user_id=?", (target,)).fetchone():
+                    return "unknown"
+                changed = con.execute("INSERT OR IGNORE INTO friend_roles VALUES(?,?,?)", (target,uid,now)).rowcount
+            else:
+                changed = con.execute("DELETE FROM friend_roles WHERE user_id=?", (target,)).rowcount
+            return "changed" if changed else "unchanged"
         if action == "name_notice_stats":
             return dict(con.execute("SELECT state,COUNT(*) FROM name_notice_v28 GROUP BY state").fetchall())
         if action == "name_notice_claim":
@@ -420,6 +439,7 @@ def db_run(action, uid=0, value=None):
         elif action == "reset":
             con.execute("DELETE FROM messages WHERE user_id=?", (uid,))
         elif action == "delete":
+            con.execute("DELETE FROM friend_roles WHERE user_id=?", (uid,))
             con.execute("DELETE FROM name_notice_v28 WHERE user_id=?", (uid,))
             con.execute("DELETE FROM messages WHERE user_id=?", (uid,))
             con.execute("DELETE FROM users WHERE user_id=?", (uid,))
@@ -576,12 +596,14 @@ async def show_payment_status(message, uid):
 def role_name(uid, state):
     if OWNER_ID > 0 and uid == OWNER_ID:
         return "Owner"
+    if state.get("friend"):
+        return "Friend"
     return "Плюс" if state.get('pro') else "Бесплатная"
 
 
 def role_line(uid, state):
     role = role_name(uid, state)
-    icon = {"Owner": "👑", "Плюс": "💠", "Бесплатная": "🆓"}[role]
+    icon = {"Owner": "👑", "Friend": "🫶", "Плюс": "💠", "Бесплатная": "🆓"}[role]
     return f"{icon} Роль: <b>{'Владелец' if role == 'Owner' else role}</b>"
 
 
@@ -601,16 +623,16 @@ def consent_keyboard():
 
 
 def smart_allowed(uid, state):
-    return bool((OWNER_ID > 0 and uid == OWNER_ID) or state.get("pro"))
+    return bool((OWNER_ID > 0 and uid == OWNER_ID) or state.get("pro") or state.get("friend"))
 
 
-def menu_keyboard(mode="soft", pro=False, uid=None):
+def menu_keyboard(mode="soft", pro=False, uid=None, friend=False):
     labels = {"soft": "🌿 Мягко", "smart": "💡 Умный", "raw": "🔥 Без фильтров"}
     rows = [[button(("✓ " if key == mode else "") + labels[key] +
-                    (" 🔒" if key == "smart" and not smart_allowed(uid, {"pro": pro}) else ""),
+                    (" 🔒" if key == "smart" and not smart_allowed(uid, {"pro": pro, "friend": friend}) else ""),
                     "mode:" + key)
              for key in ("soft", "smart", "raw")]]
-    rows.append([button("✨ Мой Plus · продлить" if pro else f"✨ Plus · {billing.PRICE} ⭐ на 7 дней", "ui:pro")])
+    rows.append([button("🫶 Friend · безлимит" if friend else "✨ Мой Plus · продлить" if pro else f"✨ Plus · {billing.PRICE} ⭐ на 7 дней", "ui:pro")])
     if OWNER_ID > 0 and uid == OWNER_ID:
         rows.append([button("🛠 Меню бота", "admin:users:0")])
     rows.append([button("❔ Как общаться", "ui:help"), button("🔒 О данных", "ui:privacy")])
@@ -759,9 +781,11 @@ async def show_menu(message, uid, edit=False):
     if agreed:
         if OWNER_ID > 0 and uid == OWNER_ID:
             quota = "∞ <b>Владелец: без квоты и паузы между запросами</b>"
+        elif state.get("friend"):
+            quota = "🫶 <b>Friend: все режимы без почасовых квот · пауза 5 с</b>"
         else:
             quota = f"⭐ <b>Плюс до {utc_date(state['until'])}</b>" if state['pro'] else f"🆓 <b>{state['remaining']}/{state['limit']}</b> запросов за последний час"
-        if mode == "smart" and not (OWNER_ID > 0 and uid == OWNER_ID):
+        if mode == "smart" and not state.get("friend") and not (OWNER_ID > 0 and uid == OWNER_ID):
             quota += f"\n🧠 Умный: <b>{state['smart_remaining']}/{billing.SMART_LIMIT}</b> осталось за скользящий час"
         bonus_line = f"\n🎁 Постоянный бонус: +{state['bonus']} к бесплатному лимиту" if state['bonus'] else ""
         caption = (
@@ -769,7 +793,7 @@ async def show_menu(message, uid, edit=False):
             f"{role_line(uid, state)}\n🎛 Твой режим: <b>{MODE_NAMES[mode]}</b>\n{quota}{bonus_line}\n\n"
             "Пиши прямо в чат. В «Умном» можно отправить фото задачи."
         )
-        kb = menu_keyboard(mode, state['pro'], uid)
+        kb = menu_keyboard(mode, state['pro'], uid, friend=state.get("friend", False))
     else:
         caption, kb = WELCOME + "\n\n" + role_line(uid, state), consent_keyboard()
     menu_photo = SMART_PHOTO if agreed and mode == "smart" else WELCOME_PHOTO
@@ -855,6 +879,8 @@ async def show_pro(message, uid):
     current = f"\n✅ <b>Активен до {utc_date(state['until'])}</b>\n" if state['pro'] else ""
     if OWNER_ID > 0 and uid == OWNER_ID:
         current = "\n👑 <b>У владельца уже нет квоты и паузы. Покупка для себя не требуется.</b>\n"
+    elif state.get("friend"):
+        current = "\n🫶 <b>У Friend все режимы без почасовых квот. Пауза — 5 с. Покупка не требуется.</b>\n"
     text = (
         "<b>💠 ГОША ПЛЮС</b>\n" + role_line(uid, state) + "\n\n"
         f"∞ Обычные режимы — без почасовой квоты\n✦ Умный — {billing.SMART_LIMIT} запросов/час\n🗓 7 дней доступа\n💫 Всего {billing.PRICE} ⭐ (Telegram Stars)\n"
@@ -865,7 +891,9 @@ async def show_pro(message, uid):
         "Оплата откроется в отдельном боте: нажми там «Старт» — появится счёт Telegram."
     )
     rows = []
-    if payments_ready():
+    if state.get("friend"):
+        pass
+    elif payments_ready():
         payload = "gl_" + secrets.token_urlsafe(24)
         await bill("create_order", uid, {'payload': payload, 'merchant_id': PAYMENT_BOT.id, 'kind': 'link'})
         rows.append([InlineKeyboardButton(text=f"✦ Оплатить Плюс · {billing.PRICE} ⭐", url=f"https://t.me/{PAYMENT_USERNAME}?start={payload}")])
@@ -985,8 +1013,8 @@ async def mode_handler(message: Message):
         await show_menu(message, uid)
         return
     detail = (f"\nДоступно {state['smart_remaining']}/{billing.SMART_LIMIT} ответов за скользящий час.\n📸 Можно прислать фото задачи с подписью или без."
-              if mode == "smart" and not (OWNER_ID > 0 and uid == OWNER_ID) else "")
-    await message.answer(f"{MODE_NAMES[mode]} — включён.{detail}", reply_markup=menu_keyboard(mode, state['pro'], uid))
+              if mode == "smart" and not state.get("friend") and not (OWNER_ID > 0 and uid == OWNER_ID) else "")
+    await message.answer(f"{MODE_NAMES[mode]} — включён.{detail}", reply_markup=menu_keyboard(mode, state['pro'], uid, friend=state.get("friend", False)))
 
 
 @router.message(Command("reset", "delete"))
@@ -1028,6 +1056,52 @@ async def tickets_handler(message: Message):
         await message.answer("Эта команда только для владельца.")
         return
     await support_service.listing(message, message.from_user.id)
+
+
+@router.message(Command("friend", "unfriend", "friends"))
+async def friend_handler(message: Message):
+    owner = message.from_user.id
+    if not owner_admin_allowed(message, owner):
+        await message.answer("Эта команда только для владельца в личке с ботом.")
+        return
+    parts = (message.text or "").split()
+    command = parts[0].split("@")[0][1:].lower()
+    if command == "friends":
+        rows = await store("friend_list", owner)
+        await message.answer("🫶 Friend — первые 50 ID:\n" + ("\n".join(str(x[0]) for x in rows) or "Пока никого."), parse_mode=None)
+        return
+    target = None
+    if len(parts) == 2 and parts[1].isascii() and parts[1].isdecimal() and len(parts[1]) <= 16:
+        target = int(parts[1])
+    elif len(parts) == 1:
+        author = getattr(getattr(message, "reply_to_message", None), "from_user", None)
+        if author and not getattr(author, "is_bot", True):
+            target = author.id
+    if target is None or not 0 < target <= 2**52-1:
+        await message.answer("/friend TELEGRAM_ID — выдать 🫶 Friend\n/unfriend TELEGRAM_ID — снять\n/friends — список. ID можно узнать командой /myid.")
+        return
+    if target == OWNER_ID:
+        await message.answer("У владельца уже есть полный доступ. Его роль не меняется.")
+        return
+    grant = command == "friend"
+    result = await store("friend_grant" if grant else "friend_revoke", owner, target)
+    if result == "unknown":
+        await message.answer("Пользователь ещё не зарегистрирован в боте. Пусть сначала нажмёт /start.")
+        return
+    if result != "changed":
+        await message.answer("Роль Friend уже выдана." if grant else "У пользователя нет роли Friend.")
+        return
+    if not grant:
+        state = await bill("status", target)
+        if not state.get("pro"):
+            await store("mode", target, "soft")
+    await message.answer(f"🫶 Friend {'выдана' if grant else 'снята'}: {target}.", parse_mode=None)
+    recipient_text = ("🫶 Тебе выдана роль Friend! Все режимы, включая «Умный», без почасовых квот. Пауза между запросами — 5 секунд. Открой /menu."
+                      if grant else "Роль Friend снята. Доступ снова зависит от твоего Plus и обычных лимитов. Открой /menu.")
+    try:
+        await (MAIN_BOT or message.bot).send_message(target, recipient_text, parse_mode=None)
+    except TelegramAPIError:
+        await message.answer("Роль сохранена, но уведомление пользователю доставить не удалось.")
 
 
 @router.message(Command("reply", "stars", "payments", "refund"))
@@ -1245,7 +1319,7 @@ async def generate(message, uid, text, photo=None, image_requested=False):
     if photo is not None and not is_smart:
         state = await bill("status", uid)
         await message.answer("📸 Фото задач разбираю в режиме «🧠 Умный». Выбери его в /menu и пришли фото ещё раз.",
-                             reply_markup=menu_keyboard(mode, state['pro'], uid))
+                             reply_markup=menu_keyboard(mode, state['pro'], uid, friend=state.get("friend", False)))
         return
     if photo is not None and (getattr(photo, "file_size", 0) or 0) > MAX_PHOTO_BYTES:
         await message.answer("📸 Фото слишком большое. Пришли снимок до 10 МБ. Запрос не списан.")
@@ -1277,7 +1351,7 @@ async def generate(message, uid, text, photo=None, image_requested=False):
                 await message.answer(f"🆓 {permit['used']}/{permit['limit']} за последний час. Следующий запрос примерно через {minutes} мин.\n💠 Плюс: 7 дней без этой квоты за {billing.PRICE} ⭐.",
                                      reply_markup=InlineKeyboardMarkup(inline_keyboard=[[button("💠 Посмотреть Плюс", "ui:pro")]]))
             else:
-                await message.answer(f"Пауза между запросами — {COOLDOWN} с.")
+                await message.answer(f"Пауза между запросами — {permit.get('cooldown', COOLDOWN)} с.")
             return
         reservation = permit['reservation']
         photo_data_url = None
@@ -1411,7 +1485,8 @@ async def show_bot_admin(message, uid, page=0, edit=False):
             f"👥 Пользователи: <b>{roster['total']}</b>\n\n" + members_table(roster['rows']) +
             f"\n\n📄 Страница {page + 1}/{roster['pages']}\n"
             "— = юзернейм не указан или пока неизвестен.\n"
-            "🎁 Подарить Плюс на сутки · ⊖ Снять Плюс с подтверждением.")
+            "🎁 Подарить Плюс на сутки · ⊖ Снять Плюс с подтверждением.\n"
+            "🫶 Friend: /friend ID · /unfriend ID · /friends")
     rows = []
     for recipient_id, username in roster['rows']:
         label = ("@" + username) if username else "Без юзернейма"
@@ -1727,8 +1802,6 @@ async def send_name_notice(merchant):
 
 async def name_notice_worker(merchant):
     # Retry the rename itself, not merely a read of its unchanged old value.
-    while not await ensure_bot_name(merchant):
-        await asyncio.sleep(30)
     logging.warning("Name notice starting: %s", await store("name_notice_stats"))
     was_working = True
     while True:
@@ -1759,6 +1832,7 @@ pay_router.message.register(support_handler, Command("paysupport", "support"))
 pay_router.message.register(tickets_handler, Command("tickets"))
 pay_router.callback_query.register(ui_callback, F.data.startswith("ui:"))
 pay_router.message.register(owner_handler, Command("reply", "stars", "payments", "refund"))
+pay_router.message.register(friend_handler, Command("friend", "unfriend", "friends"))
 pay_router.message.register(payment_status_handler, Command("paymentstatus"))
 pay_router.message.register(myid_handler, Command("myid"))
 pay_router.message.register(role_handler, Command("role"))
@@ -1879,7 +1953,6 @@ async def payment_name_retry_worker(merchant):
 async def apply_brand(merchant, payment=False):
     if not payment:
         await update_bot_description(merchant)
-    await ensure_bot_name(merchant, payment=payment)
     if not AVATAR_PHOTO.is_file():
         return
     digest = hashlib.sha256(AVATAR_PHOTO.read_bytes()).hexdigest()
@@ -1979,8 +2052,6 @@ async def main():
             await apply_brand(merchant, payment=PAYMENT_BOT is not None and merchant.id == PAYMENT_BOT.id)
         tasks.append(asyncio.create_task(bonus_retirement_worker(MAIN_BOT)))
         tasks.append(asyncio.create_task(name_notice_worker(MAIN_BOT)))
-        if PAYMENT_BOT is not None:
-            tasks.append(asyncio.create_task(payment_name_retry_worker(PAYMENT_BOT)))
         await MAIN_BOT.set_my_commands([
             BotCommand(command="menu", description="🎛 Главное меню"),
             BotCommand(command="plus", description=f"💠 Плюс · 7 дней за {billing.PRICE} ⭐"),
@@ -2001,7 +2072,7 @@ async def main():
                 BotCommand(command="terms", description="📜 Условия"),
                 BotCommand(command="paysupport", description="🛟 Помощь с покупкой"),
             ])
-        logging.warning("Gosha v30 neutral service wording; bots=%s payments=%s owner_has_no_quota=True", len(bots), payments_ready())
+        logging.warning("Gosha v31 Friend role; bots=%s payments=%s owner_has_no_quota=True", len(bots), payments_ready())
         if not payments_ready():
             logging.warning("Payment setup checks failed: %s", ", ".join(name for name, ok, _ in payment_checks() if not ok))
         await dp.start_polling(*bots, allowed_updates=["message", "callback_query", "pre_checkout_query"])

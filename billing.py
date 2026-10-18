@@ -26,6 +26,9 @@ def connect(path):
 def init(path):
     with closing(connect(path)) as con, con:
         con.executescript('''
+        CREATE TABLE IF NOT EXISTS friend_roles (
+            user_id INTEGER PRIMARY KEY, granted_by INTEGER NOT NULL, granted_at REAL NOT NULL
+        );
         CREATE TABLE IF NOT EXISTS pro_orders (
             payload TEXT PRIMARY KEY, user_id INTEGER NOT NULL,
             created REAL NOT NULL, state TEXT NOT NULL DEFAULT 'new',
@@ -128,7 +131,8 @@ def snapshot(con, uid, now):
                       (uid, now - WINDOW)).fetchone()
     smart = con.execute('SELECT COUNT(*),MIN(at_ts) FROM smart_hour_usage WHERE user_id=? AND at_ts>?',
                         (uid, now - WINDOW)).fetchone()
-    return {'smart_used': smart[0], 'smart_limit': SMART_LIMIT,
+    friend = con.execute('SELECT 1 FROM friend_roles WHERE user_id=?', (uid,)).fetchone() is not None
+    return {'friend': friend, 'smart_used': smart[0], 'smart_limit': SMART_LIMIT,
             'smart_remaining': max(0, SMART_LIMIT - smart[0]),
             'smart_next_slot': smart[1] + WINDOW if smart[1] is not None else now,
             'pro': until > now, 'until': until, 'used': row[0],
@@ -212,6 +216,9 @@ def run(path, action, uid=0, value=None, now=None):
             exempt = bool(value.get('bypass_quota', False)) if isinstance(value, dict) else False
             smart_mode = isinstance(value, dict) and bool(value.get('smart') or value.get('require_pro'))
             state = snapshot(con, uid, now)
+            if state['friend'] and not exempt:
+                cooldown = 5
+                exempt = True
             # Authorize smart generation inside the same transaction as its reservation.
             if isinstance(value, dict) and value.get('require_pro') and not exempt and not state['pro']:
                 return {'ok': False, 'reason': 'pro_required'}
@@ -220,7 +227,7 @@ def run(path, action, uid=0, value=None, now=None):
                         'used': state['smart_used'], 'next_slot': state['smart_next_slot']}
             rate = con.execute('SELECT last_ts FROM rate_limits WHERE user_id=?', (uid,)).fetchone()
             if rate and now - rate[0] < cooldown:
-                return {'ok': False, 'reason': 'cooldown'}
+                return {'ok': False, 'reason': 'cooldown', 'cooldown': cooldown}
             if not exempt and not state['pro'] and state['remaining'] == 0:
                 return {'ok': False, 'reason': 'quota', 'next_slot': state['next_slot'], 'limit': state['limit'], 'used': state['used']}
             con.execute('INSERT INTO rate_limits VALUES(?,?) ON CONFLICT(user_id) DO UPDATE SET last_ts=excluded.last_ts', (uid, now))
