@@ -244,6 +244,13 @@ CHEAT_CODE_RULE = (
 )
 SYSTEM += "\n" + CHEAT_CODE_RULE
 SMART_SYSTEM += "\n" + CHEAT_CODE_RULE
+SERVICE_WORDING_RULE = (
+    "В пользовательских ответах не указывай название сервиса-посредника и его домен. "
+    "Для описания обработки данных используй формулировку «внешний ИИ-сервис и провайдер модели». "
+    "Не утверждай, что обработка полностью локальная или данные не передаются третьим лицам."
+)
+SYSTEM += "\n" + SERVICE_WORDING_RULE
+SMART_SYSTEM += "\n" + SERVICE_WORDING_RULE
 
 _CHEAT_TERMS = re.compile(
     r"\b(?:чит(?:а|у|ом|е|ы|ов|ам|ами|ах)?|читерск\w*|аимбот\w*|эймбот\w*|"
@@ -623,12 +630,12 @@ WELCOME = (
     "💀 Без фильтров — самая резкая словесная перепалка.\n"
     "🧠 Умный — задачи, фото и объяснения · Плюс, 5 запросов/час.\n\n"
     "<b>16+</b> · Это ИИ-персонаж. Продолжая, соглашаешься на выбранный "
-    "стиль и обработку сообщений: текст передаётся OpenRouter и провайдеру.\n"
+    "стиль и обработку сообщений: текст передаётся внешнему ИИ-сервису и провайдеру модели.\n"
     "Не хочешь ругани — сразу выбирай «Мягко»."
 )
 PRIVACY_DETAILS = (
     "<b>🔒 О данных</b>\n\n"
-    "Текущий текст, присланное для разбора фото и до 24 прошлых сообщений передаются OpenRouter и провайдеру. "
+    "Текущий текст, присланное для разбора фото и до 24 прошлых сообщений передаются внешнему ИИ-сервису и провайдеру модели. "
     "Фото не сохраняются в локальной базе бота; сохраняются текст запроса и ответ. "
     "Не отправляй пароли и чужие личные данные.\n\n"
     "/reset — стереть переписку. /delete — также настройки и согласие. "
@@ -680,7 +687,7 @@ HELP_DETAILS = (
 
 PRIVACY = (
     "<b>🔒 О данных — коротко</b>\n\n"
-    "• Текст, фото задачи и до 24 прошлых сообщений передаются OpenRouter и провайдеру ИИ.\n"
+    "• Текст, фото задачи и до 24 прошлых сообщений передаются внешнему ИИ-сервису и провайдеру модели.\n"
     "• Фото не хранятся в базе бота; текст и ответы сохраняются. Не присылай секреты.\n"
     "• /reset — забыть диалог; /delete — удалить также настройки и согласие. Платежи, оплаченный доступ и временные счётчики сохраняются.\n"
     "• Поддержку читает владелец, не ИИ. /delete удаляет номера обращений в базе, но не копии в Telegram и у провайдеров."
@@ -1204,6 +1211,10 @@ async def image_handler(message: Message):
     await image_prompt(message, message.from_user.id)
 
 
+def public_model_text(text):
+    return re.sub(r"open[\s_-]*router|опен[\s_-]*роутер", "внешний ИИ-сервис", text, flags=re.I)
+
+
 def private_owner_identity(message, uid):
     return (OWNER_ID > 0 and uid == OWNER_ID
             and getattr(getattr(message, "chat", None), "type", None) == "private")
@@ -1211,7 +1222,7 @@ def private_owner_identity(message, uid):
 
 def configured_model_identity(mode):
     model = SMART_MODEL if mode == "smart" else MODEL
-    return f"В этом режиме настроена модель {model} через OpenRouter."
+    return public_model_text(f"В этом режиме настроена модель {model}.")
 
 
 async def generate(message, uid, text, photo=None, image_requested=False):
@@ -1333,6 +1344,7 @@ async def generate(message, uid, text, photo=None, image_requested=False):
         if is_blocked_game_output(answer):
             await message.answer(CHEAT_CODE_REPLY, parse_mode=None)
             return
+        answer = public_model_text(answer)
         # 1800 code points fit Telegram's UTF-16 limit even for all-emoji answers.
         for offset in range(0, len(answer), 1800):
             await message.answer(answer[offset:offset + 1800], parse_mode=None)
@@ -1989,7 +2001,7 @@ async def main():
                 BotCommand(command="terms", description="📜 Условия"),
                 BotCommand(command="paysupport", description="🛟 Помощь с покупкой"),
             ])
-        logging.warning("Gosha v29 verified name retry and one-time notice; bots=%s payments=%s owner_has_no_quota=True", len(bots), payments_ready())
+        logging.warning("Gosha v30 neutral service wording; bots=%s payments=%s owner_has_no_quota=True", len(bots), payments_ready())
         if not payments_ready():
             logging.warning("Payment setup checks failed: %s", ", ".join(name for name, ok, _ in payment_checks() if not ok))
         await dp.start_polling(*bots, allowed_updates=["message", "callback_query", "pre_checkout_query"])
