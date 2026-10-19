@@ -754,14 +754,15 @@ router.my_chat_member.register(channel_membership_updated)
 
 def channel_gate_text(state=False, checked=False):
     body = (CHANNEL_GATE_TITLE + "\n\n"
-            "Со мной можно поболтать, разобрать задачу или просто выговориться 💬\n\n"
+            "💬 Чтобы общаться с Гошей, подпишись на его канал.\n\n"
             "🫶 Чтобы не потерять Гошу, подпишись на Гошин ТГК — там новости и обновления.\n\n"
-            "Чтобы пользоваться ботом, нужна подписка. Нажми «📣 Гошин ТГК», "
-            "а потом «✅ Проверить подписку» — и начнём ✨")
+            "Меню и покупка Plus доступны без подписки на канал.\n\n"
+            "Нажми «📣 Гошин ТГК», затем «✅ Проверить подписку» "
+            "и отправь сообщение ещё раз ✨")
     if state is None:
         body += "\n\n⚠️ Проверка сейчас недоступна. Попробуй чуть позже. Помощь: /support."
     elif checked:
-        body += "\n\n🙈 Ты ещё не подписался на канал. Подпишись, затем нажми «Проверить подписку» — и откроется доступ."
+        body += "\n\n🙈 Ты ещё не подписался на канал. Подпишись, затем нажми «Проверить подписку» — и сможем общаться."
     return body
 
 
@@ -796,7 +797,7 @@ async def show_channel_gate(message, uid, state=False, checked=False):
 
 
 class ChannelSubscriptionMiddleware(BaseMiddleware):
-    # Service, data controls, human support and financial records stay accessible.
+    # All commands and navigation stay accessible. Only incoming chat input is gated.
     safe_commands = frozenset({"support", "paysupport", "tickets", "privacy", "terms", "help",
                                "myid", "role", "reset", "delete", "paymentstatus", "reply",
                                "stars", "payments", "refund", "friend", "unfriend", "friends", "plus", "pro", "channelstatus", "announce_move", "move_status", "cancel_move", "unban"})
@@ -804,35 +805,25 @@ class ChannelSubscriptionMiddleware(BaseMiddleware):
                                 "ui:terms", "ui:help", "ui:help_details", "ui:paymentstatus"})
 
     async def __call__(self, handler, event, data):
-        if isinstance(event, Message):
-            if event.successful_payment or event.refunded_payment:
-                return await handler(event, data)
-            text = (event.text or "").strip()
-            if text.startswith("/"):
-                command = text.split()[0].split("@", 1)[0][1:].lower()
-                if command in self.safe_commands:
-                    return await handler(event, data)
-                # Purchase/deep-link entry points are never gated by channel membership.
-                parts = text.split(maxsplit=1)
-                if command == "start" and len(parts) == 2 and parts[1] in ("plus", "pro", "paid"):
-                    return await handler(event, data)
-            message = event
-        elif isinstance(event, CallbackQuery):
-            if event.data in self.safe_callbacks or (event.data or "").startswith(("sup:", "admin:")):
-                return await handler(event, data)
-            message = event.message
-            if message is None or not isinstance(message, Message):
-                return
-        else:
+        # Channel membership is required for chat input, NOT for opening the UI.
+        # None of the command or callback handlers performs AI inference.
+        # Text, photo and voice all enter their handlers through this middleware.
+        if not isinstance(event, Message):
             return await handler(event, data)
-        user = getattr(event, "from_user", None)
+        if event.successful_payment or event.refunded_payment:
+            return await handler(event, data)
+        text = event.text or ""
+        if text.startswith("/"):
+            return await handler(event, data)
+        if not (event.text is not None or event.photo or event.voice):
+            return await handler(event, data)
+        user = event.from_user
         if user is None or user.is_bot:
             return
-        # Always use Telegram's sender identity, never a UID supplied in callback data.
-        merchant = MAIN_BOT or data.get("bot") or message.bot
+        merchant = MAIN_BOT or data.get("bot") or event.bot
         state = await channel_subscription_state(merchant, user.id)
         if state is not True:
-            await show_channel_gate(message, user.id, state=state)
+            await show_channel_gate(event, user.id, state=state)
             return
         return await handler(event, data)
 
@@ -2787,7 +2778,7 @@ async def main():
                 BotCommand(command="terms", description="📜 Условия"),
                 BotCommand(command="paysupport", description="🛟 Помощь с покупкой"),
             ])
-        logging.warning("Gosha v36 owner bans; bots=%s payments=%s owner_has_no_quota=True", len(bots), payments_ready())
+        logging.warning("Gosha v37 channel required for chat only; bots=%s payments=%s owner_has_no_quota=True", len(bots), payments_ready())
         if not payments_ready():
             logging.warning("Payment setup checks failed: %s", ", ".join(name for name, ok, _ in payment_checks() if not ok))
         await dp.start_polling(*bots, allowed_updates=["message", "callback_query", "pre_checkout_query", "chat_member", "my_chat_member"])
