@@ -765,6 +765,39 @@ class BanMiddleware(BaseMiddleware):
         return None
 
 
+class ImageInputNavigationMiddleware(BaseMiddleware):
+    async def __call__(self,handler,event,data):
+        message=event.message if isinstance(event,CallbackQuery) else event
+        user=getattr(event,'from_user',None)
+        if (not isinstance(message,Message) or not user or user.is_bot
+                or message.chat.type!=ChatType.PRIVATE or message.chat.id!=user.id
+                or MAIN_BOT is None or message.bot.id!=MAIN_BOT.id):
+            return await handler(event,data)
+        uid,bid=user.id,message.bot.id
+        if isinstance(event,Message):
+            if event.successful_payment or event.refunded_payment:
+                return await handler(event,data)
+            text=(event.text or '').strip()
+            alias=re.fullmatch(r'(?:IMG|IMH)(?:\s+(.*))?',text,re.I|re.S)
+            if alias:
+                event=event.model_copy(update={'text':'/img'+(' '+alias.group(1) if alias.group(1) else ''),
+                                                'entities':None}).as_(message.bot)
+                text=event.text
+            clear=text.startswith('/')
+            reply=event.reply_to_message
+            if not clear and reply:
+                clear=bool(await support_service.call('lookup',bid=bid,uid=uid,mid=reply.message_id))
+            if clear:
+                old=await image_input('clear',bid,uid)
+                await remove_image_input_prompt(message.bot,uid,old)
+        elif (event.data or '').startswith(('ui:','mode:','pro:','sup:','admin:','shop:','credit:','maintenance:')):
+            old=await image_input('clear',bid,uid)
+            # The clicked UI screen is handled by the normal navigation code.
+            if old and old['prompt_mid']!=message.message_id:
+                await remove_image_input_prompt(message.bot,uid,old)
+        return await handler(event,data)
+
+
 ban_gate = BanMiddleware()
 user_lock = UserLockMiddleware()
 router.message.outer_middleware(BottomNavigationMiddleware())
@@ -773,8 +806,10 @@ router.message.outer_middleware(user_lock)
 router.callback_query.outer_middleware(maintenance_gate)
 router.callback_query.outer_middleware(user_lock)
 router.message.outer_middleware(ban_gate)
+router.message.outer_middleware(ImageInputNavigationMiddleware())
 router.message.outer_middleware(SupportMiddleware(support_service))
 router.callback_query.outer_middleware(ban_gate)
+router.callback_query.outer_middleware(ImageInputNavigationMiddleware())
 router.callback_query.outer_middleware(SupportMiddleware(support_service))
 pay_router.message.outer_middleware(maintenance_gate)
 pay_router.message.outer_middleware(user_lock)
@@ -1349,7 +1384,7 @@ async def remove_navigation_screen(message, uid):
     body = (getattr(message, "text", None) or getattr(message, "caption", None) or "").lstrip()
     if body.startswith(("✉ TICKET #", "✉ SUPPORT · #", "🛟 Ответ поддержки", "✉ ОБРАЩЕНИЕ №", "✉ ПОДДЕРЖКА · №")):
         return False
-    if getattr(message, "photo", None) and body.startswith(("🎨 МАСТЕРСКАЯ ГОШИ", "🎨 GOSHA STUDIO")):
+    if getattr(message, "photo", None) and body.startswith(("🎨 МАСТЕРСКАЯ ГОШИ", "🎨 GOSHA STUDIO", "🎨 Готово!")):
         return False
     try:
         await message.delete()
@@ -1806,17 +1841,88 @@ def disabled_image_request(text):
     return bool(_INTENT.match((text or '').strip()))
 
 
+def image_input_run(action,bid,uid,mid=0,now=None):
+    now=time.time() if now is None else now
+    with closing(sqlite3.connect(DB,timeout=10)) as con,con:
+        con.row_factory=sqlite3.Row
+        con.execute('BEGIN IMMEDIATE')
+        con.execute("""CREATE TABLE IF NOT EXISTS image_input_sessions(
+            bot_id INTEGER NOT NULL,user_id INTEGER NOT NULL,prompt_mid INTEGER NOT NULL DEFAULT 0,
+            expires REAL NOT NULL,PRIMARY KEY(bot_id,user_id))""")
+        row=con.execute('SELECT * FROM image_input_sessions WHERE bot_id=? AND user_id=?',(bid,uid)).fetchone()
+        state=dict(row) if row else None
+        if action=='set':
+            con.execute('INSERT INTO image_input_sessions VALUES(?,?,?,?) ON CONFLICT(bot_id,user_id) DO UPDATE SET prompt_mid=excluded.prompt_mid,expires=excluded.expires',
+                        (bid,uid,mid,now+1800))
+        elif action=='clear':
+            con.execute('DELETE FROM image_input_sessions WHERE bot_id=? AND user_id=?',(bid,uid))
+        elif action=='touch':
+            con.execute('UPDATE image_input_sessions SET expires=? WHERE bot_id=? AND user_id=?',(now+1800,bid,uid))
+        elif action!='peek':
+            raise ValueError('Unknown image input action')
+        return state
+
+
+async def image_input(action,bid,uid,mid=0):
+    return await asyncio.to_thread(image_input_run,action,bid,uid,mid)
+
+
+def image_input_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[[button('← Главное меню','ui:menu')]])
+
+
+async def remove_image_input_prompt(bot,uid,state):
+    mid=state.get('prompt_mid',0) if state else 0
+    if isinstance(mid,int) and mid>0:
+        try:
+            await bot.delete_message(chat_id=uid,message_id=mid)
+        except (TelegramAPIError,OSError,asyncio.TimeoutError):
+            pass
+
+
 async def image_prompt(message, uid):
-    await message.answer("🎨 Опиши картинку: например, «Нарисуй кота-космонавта».\nИли: /image твоё описание.\nPlus — 1 в день, Friend — 10 в час. Купленные генерации не сгорают.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[button("🎨 Пакеты генераций", "ui:shop")],[button("← Главное меню", "ui:menu")]]))
-
-
-@router.message(Command("image", "draw"))
-async def image_handler(message: Message):
-    parts = (message.text or "").split(maxsplit=1)
-    if len(parts) != 2:
-        await image_prompt(message, message.from_user.id)
+    if message.chat.type!=ChatType.PRIVATE or message.chat.id!=uid:
         return
-    await generate_image(message, message.from_user.id, parts[1])
+    if not await consent(message,uid):
+        return
+    await support_service.call('clear',bid=message.bot.id,uid=uid)
+    sent=await message.answer('🎨 Что нарисовать?\n\nОтправь описание следующим сообщением — например, «Сова на ёлке».\n\nЗдесь каждое сообщение создаёт картинку. Для обычного чата нажми «Главное меню».',
+                             reply_markup=image_input_keyboard(),parse_mode=None)
+    mid=getattr(sent,'message_id',0)
+    old=await image_input('set',message.bot.id,uid,mid if isinstance(mid,int) else 0)
+    if old and old['prompt_mid']!=mid:
+        await remove_image_input_prompt(message.bot,uid,old)
+
+
+@router.message(Command('image','draw','img','imh',ignore_case=True))
+async def image_handler(message: Message):
+    parts=(message.text or '').split(maxsplit=1)
+    if len(parts)!=2:
+        await image_prompt(message,message.from_user.id)
+        return
+    old=await image_input('clear',message.bot.id,message.from_user.id)
+    await remove_image_input_prompt(message.bot,message.from_user.id,old)
+    await generate_image(message,message.from_user.id,parts[1])
+
+
+async def image_waiting_state(message):
+    uid=message.from_user.id
+    state=await image_input('peek',message.bot.id,uid)
+    if state and state['expires']<=time.time():
+        old=await image_input('clear',message.bot.id,uid)
+        await remove_image_input_prompt(message.bot,uid,old)
+        await message.answer('🎨 Режим картинок завершён после паузы. Чтобы продолжить, отправь /img. Это сообщение не отправлено ИИ.',
+                             reply_markup=image_input_keyboard())
+        return 'expired'
+    return 'active' if state else None
+
+
+async def image_nontext_wait(message):
+    state=await image_waiting_state(message)
+    if state=='active':
+        await message.answer('🎨 Сейчас жду текст: напиши, какую картинку нарисовать. Или вернись в главное меню.',
+                             reply_markup=image_input_keyboard())
+    return bool(state)
 
 
 def public_model_text(text):
@@ -2427,7 +2533,7 @@ async def generate_image(message,uid,prompt,voice_handoff=False):
         if reservation:
             await eco('sending',uid,reservation)
         stage='delivery'
-        await message.answer_photo(BufferedInputFile(blob,filename='gosha.jpg'),caption='🎨 Готово! Ещё идеи? Пиши новое описание.')
+        await message.answer_photo(BufferedInputFile(blob,filename='gosha.jpg'),caption='🎨 Готово! Ещё идеи? Пиши новое описание.',reply_markup=image_input_keyboard() if await image_input('peek',message.bot.id,uid) else None)
         delivered=True
         if reservation:
             await eco('commit',uid,reservation)
@@ -2723,22 +2829,38 @@ async def unknown(message: Message):
 
 @router.message(F.text)
 async def chat(message: Message):
+    waiting=await image_waiting_state(message)
+    if waiting=='expired':
+        return
+    if waiting=='active':
+        if not (message.text or '').strip():
+            await message.answer('🎨 Напиши текстовое описание картинки.',reply_markup=image_input_keyboard())
+            return
+        await image_input('touch',message.bot.id,message.from_user.id)
+        await generate_image(message,message.from_user.id,message.text)
+        return
     await generate(message, message.from_user.id, message.text)
 
 
 @router.message(F.photo)
 async def photo_task(message: Message):
+    if await image_nontext_wait(message):
+        return
     text = (message.caption or "").strip() or PHOTO_DEFAULT_TASK
     await generate(message, message.from_user.id, text, photo=message.photo[-1])
 
 
 @router.message(F.voice)
 async def voice_message(message: Message):
+    if await image_nontext_wait(message):
+        return
     await generate(message, message.from_user.id, "", voice=message.voice)
 
 
 @router.message()
 async def unsupported(message: Message):
+    if await image_nontext_wait(message):
+        return
     await message.answer("Пришли текст или голосовое 🎙 — отвечу текстом. Фото задач разбираю в «Умном». Документы пока не читаю.")
 
 
@@ -3499,6 +3621,7 @@ async def main():
             BotCommand(command="shop", description="🛍 Магазин токенов и картинок"),
             BotCommand(command="ref", description="🤝 Пригласить друзей"),
             BotCommand(command="image", description="🎨 Создать картинку"),
+            BotCommand(command="img", description="🎨 Войти в режим картинок"),
             BotCommand(command="soft", description="😌 Без мата"),
             BotCommand(command="raw", description="💀 Без фильтров"),
             BotCommand(command="smart", description="🧠 Умный · Плюс"),
@@ -3515,7 +3638,7 @@ async def main():
                 BotCommand(command="terms", description="📜 Условия"),
                 BotCommand(command="paysupport", description="🛟 Помощь с покупкой"),
             ])
-        logging.warning("Gosha v47 image prompt translation; Cloudflare image API; waiting animation; invitation rewards cap 8m; shared tokens, referrals, shop and maintenance; bots=%s payments=%s owner_has_no_quota=True", len(bots), payments_ready())
+        logging.warning("Gosha v48 image input mode; prompt translation; Cloudflare image API; waiting animation; invitation rewards cap 8m; shared tokens, referrals, shop and maintenance; bots=%s payments=%s owner_has_no_quota=True", len(bots), payments_ready())
         if not payments_ready():
             logging.warning("Payment setup checks failed: %s", ", ".join(name for name, ok, _ in payment_checks() if not ok))
         await dp.start_polling(*bots, allowed_updates=["message", "callback_query", "pre_checkout_query", "chat_member", "my_chat_member"])
