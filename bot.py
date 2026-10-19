@@ -24,7 +24,8 @@ from aiogram.exceptions import TelegramBadRequest, TelegramAPIError, TelegramNet
 from aiogram.filters import BaseFilter, Command, CommandStart
 from aiogram.types import (Message, CallbackQuery, InlineKeyboardButton,
                            InlineKeyboardMarkup, FSInputFile, BotCommand, MenuButtonCommands,
-                           PreCheckoutQuery, LabeledPrice, InputProfilePhotoStatic, InputMediaPhoto)
+                           PreCheckoutQuery, LabeledPrice, InputProfilePhotoStatic, InputMediaPhoto,
+                           ReplyKeyboardMarkup, KeyboardButton)
 from aiogram.utils.token import TokenValidationError
 from dotenv import load_dotenv
 from openai import AsyncOpenAI, APIError
@@ -353,6 +354,9 @@ def db_init():
             lease_until REAL NOT NULL DEFAULT 0, attempts INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY(campaign_key,user_id,pass_no));
         CREATE INDEX IF NOT EXISTS move_due ON move_deliveries(state,next_attempt);
+        CREATE TABLE IF NOT EXISTS bottom_keyboards (
+            bot_id INTEGER NOT NULL, user_id INTEGER NOT NULL, version INTEGER NOT NULL,
+            message_id INTEGER NOT NULL, PRIMARY KEY(bot_id,user_id));
         CREATE TABLE IF NOT EXISTS bot_bans (
             user_id INTEGER PRIMARY KEY, banned_by INTEGER NOT NULL, banned_at REAL NOT NULL);
         CREATE TABLE IF NOT EXISTS ban_confirmations (
@@ -403,6 +407,12 @@ def db_run(action, uid=0, value=None):
     day = datetime.now(timezone.utc).date().isoformat()
     now = time.time()
     with closing(sqlite3.connect(DB, timeout=10)) as con, con:
+        if action == "keyboard_get":
+            row = con.execute("SELECT version,message_id FROM bottom_keyboards WHERE bot_id=? AND user_id=?", (int(value),uid)).fetchone()
+            return {"version":row[0],"message_id":row[1]} if row else None
+        if action == "keyboard_save":
+            con.execute("INSERT INTO bottom_keyboards VALUES(?,?,?,?) ON CONFLICT(bot_id,user_id) DO UPDATE SET version=excluded.version,message_id=excluded.message_id", (int(value['bot_id']),uid,int(value['version']),int(value['message_id'])))
+            return
         if action == "ban_status":
             return bool(uid != OWNER_ID and con.execute("SELECT 1 FROM bot_bans WHERE user_id=?", (uid,)).fetchone())
         if action in ("ban_prepare", "ban_confirm", "unban"):
@@ -504,6 +514,7 @@ def db_run(action, uid=0, value=None):
         elif action == "reset":
             con.execute("DELETE FROM messages WHERE user_id=?", (uid,))
         elif action == "delete":
+            con.execute("DELETE FROM bottom_keyboards WHERE user_id=?", (uid,))
             con.execute("DELETE FROM ban_confirmations WHERE user_id=?", (uid,))
             con.execute("DELETE FROM move_deliveries WHERE user_id=?", (uid,))
             con.execute("DELETE FROM friend_roles WHERE user_id=?", (uid,))
@@ -559,6 +570,69 @@ VOICE_CLIENT = None
 in_flight = 0
 ERROR_MESSAGE = "Сервера сдохли"
 PRO_PHOTO = BASE_DIR / "pro.jpg"
+
+
+BOTTOM_ACTIONS = {
+    "🎛 Главное меню": "/menu",
+    "🧹 Сбросить историю": "/reset",
+    "✨ Мой Plus": "/plus",
+    "❔ Как общаться": "/help",
+    "🛟 Поддержка": "/support",
+}
+BOTTOM_KEYBOARD_VERSION = 1
+
+
+def bottom_keyboard():
+    return ReplyKeyboardMarkup(keyboard=[
+        [KeyboardButton(text="🎛 Главное меню")],
+        [KeyboardButton(text="🧹 Сбросить историю"), KeyboardButton(text="✨ Мой Plus")],
+        [KeyboardButton(text="❔ Как общаться"), KeyboardButton(text="🛟 Поддержка")],
+    ], resize_keyboard=True, is_persistent=True, one_time_keyboard=False,
+       input_field_placeholder="Напиши Гоше или выбери раздел…")
+
+
+class BottomNavigationMiddleware(BaseMiddleware):
+    """Translate exact quick-button labels BEFORE support, bans and channel checks.
+
+    All existing command handlers and permission checks remain authoritative.
+    A press is navigation, never a billable message to AI or a support-ticket reply.
+    """
+    async def __call__(self, handler, event, data):
+        merchant = data.get("bot")
+        if (isinstance(event, Message) and event.chat.type == ChatType.PRIVATE
+                and MAIN_BOT is not None and merchant is not None and merchant.id == MAIN_BOT.id
+                and not event.successful_payment and not event.refunded_payment):
+            command = BOTTOM_ACTIONS.get(event.text or "")
+            if command:
+                event = event.model_copy(update={"text":command,"entities":None}).as_(merchant)
+        return await handler(event, data)
+
+
+async def ensure_bottom_keyboard(message, uid, force=False):
+    merchant = message.bot
+    bot_id = getattr(merchant, "id", None)
+    if (not isinstance(bot_id, int) or bot_id <= 0 or message.chat.type != ChatType.PRIVATE
+            or message.chat.id != uid or (MAIN_BOT is not None and bot_id != MAIN_BOT.id)):
+        return False
+    try:
+        previous = await store("keyboard_get", uid, bot_id)
+        if previous and previous['version'] == BOTTOM_KEYBOARD_VERSION and not force:
+            return True
+        sent = await message.answer("⌨️ Быстрое меню — внизу чата 👇", parse_mode=None,
+                                    reply_markup=bottom_keyboard(), request_timeout=8)
+        mid = getattr(sent, "message_id", None)
+        if isinstance(mid, int) and mid > 0:
+            await store("keyboard_save", uid, {"bot_id":bot_id,"version":BOTTOM_KEYBOARD_VERSION,"message_id":mid})
+            if previous and previous['message_id'] != mid:
+                try:
+                    await merchant.delete_message(chat_id=uid, message_id=previous['message_id'], request_timeout=5)
+                except (TelegramAPIError, OSError, asyncio.TimeoutError):
+                    logging.warning("Old bottom-keyboard hint could not be removed")
+        return True
+    except (sqlite3.Error, TelegramAPIError, OSError, asyncio.TimeoutError) as exc:
+        # Never stop the actual menu or purchase flow because an optional keyboard failed.
+        logging.warning("Bottom keyboard unavailable: type=%s", type(exc).__name__)
+        return False
 
 
 class UserLockMiddleware(BaseMiddleware):
@@ -627,6 +701,7 @@ class BanMiddleware(BaseMiddleware):
 
 ban_gate = BanMiddleware()
 user_lock = UserLockMiddleware()
+router.message.outer_middleware(BottomNavigationMiddleware())
 router.message.outer_middleware(user_lock)
 router.callback_query.outer_middleware(user_lock)
 router.message.outer_middleware(ban_gate)
@@ -1085,7 +1160,7 @@ HELP = (
     "✦ <b>Умный</b> — задачи, фото и объяснения; Плюс, 5 запросов/час.\n\n"
     f"Бесплатно — {billing.FREE_LIMIT} ответов за скользящий час.\n"
     "Фото задачи отправляй в «Умном»: чётко, целиком, до 10 МБ.\n"
-    "/reset — начать диалог заново. Если что-то не работает — жми «Поддержка»."
+    "/reset — начать диалог заново. /keyboard — показать нижние кнопки. Если что-то не работает — жми «Поддержка»."
 )
 
 
@@ -1154,7 +1229,7 @@ async def show_menu(message, uid, edit=False):
         caption = (
             "<b>ГОША · коротко и в лицо</b>\n\n"
             f"{role_line(uid, state)}\n🎛 Твой режим: <b>{MODE_NAMES[mode]}</b>\n{quota}{bonus_line}\n\n"
-            "Пиши прямо в чат. В «Умном» можно отправить фото задачи."
+            "Пиши прямо в чат. В «Умном» можно отправить фото задачи.\n⌨️ Быстрые разделы — внизу чата. /keyboard — показать кнопки снова."
         )
         kb = menu_keyboard(mode, state['pro'], uid, friend=state.get("friend", False))
     else:
@@ -1337,6 +1412,7 @@ async def payment_refunded(message: Message):
 @router.message(CommandStart())
 @router.message(Command("menu", "mode"))
 async def start(message: Message):
+    await ensure_bottom_keyboard(message, message.from_user.id)
     parts = (message.text or "").split(maxsplit=1)
     arg = parts[1] if len(parts) == 2 else ""
     if arg in ("plus", "pro"):
@@ -1345,6 +1421,11 @@ async def start(message: Message):
         await message.answer(TERMS, parse_mode="HTML", reply_markup=back_keyboard())
     else:
         await show_menu(message, message.from_user.id)
+
+
+@router.message(Command("keyboard"))
+async def keyboard_handler(message: Message):
+    await ensure_bottom_keyboard(message, message.from_user.id, force=True)
 
 
 @router.message(Command("agree"))
@@ -2760,6 +2841,7 @@ async def main():
         tasks.append(asyncio.create_task(move_notice_worker(MAIN_BOT)))
         await MAIN_BOT.set_my_commands([
             BotCommand(command="menu", description="🎛 Главное меню"),
+            BotCommand(command="keyboard", description="⌨️ Показать нижние кнопки"),
             BotCommand(command="plus", description=f"💠 Плюс · 7 дней за {billing.PRICE} ⭐"),
             BotCommand(command="role", description="👤 Моя роль"),
             BotCommand(command="soft", description="😌 Без мата"),
@@ -2778,7 +2860,7 @@ async def main():
                 BotCommand(command="terms", description="📜 Условия"),
                 BotCommand(command="paysupport", description="🛟 Помощь с покупкой"),
             ])
-        logging.warning("Gosha v37 channel required for chat only; bots=%s payments=%s owner_has_no_quota=True", len(bots), payments_ready())
+        logging.warning("Gosha v38 persistent bottom keyboard; bots=%s payments=%s owner_has_no_quota=True", len(bots), payments_ready())
         if not payments_ready():
             logging.warning("Payment setup checks failed: %s", ", ".join(name for name, ok, _ in payment_checks() if not ok))
         await dp.start_polling(*bots, allowed_updates=["message", "callback_query", "pre_checkout_query", "chat_member", "my_chat_member"])
