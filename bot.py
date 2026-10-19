@@ -17,7 +17,7 @@ from ui import button as themed_button
 from support import Support, SupportMiddleware
 import sqlite3
 import time
-from contextlib import closing
+from contextlib import closing, suppress
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -45,8 +45,9 @@ load_dotenv()
 # OPENROUTER_API_KEY=твой_ключ_OpenRouter
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
-# Separate Pollinations secret: never reuse the chat API key for image generation.
+# Separate Cloudflare API token: never reuse the chat API key for generation.
 IMAGE_API_KEY = os.getenv("IMAGE_API_KEY", "").strip()
+CLOUDFLARE_ACCOUNT_ID = os.getenv("CLOUDFLARE_ACCOUNT_ID", "").strip()
 # Отдельный бот от BotFather; ключ хранить только в Railway Variables.
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
 VOICE_MODEL = "whisper-large-v3-turbo"
@@ -2104,7 +2105,7 @@ async def create_shop_invoice(message,uid,link):
         await message.answer(ERROR_MESSAGE)
 
 
-IMAGE_MODEL=os.getenv('IMAGE_MODEL','openai/gpt-image-2').strip()
+IMAGE_MODEL=os.getenv('IMAGE_MODEL','@cf/black-forest-labs/flux-1-schnell').strip()
 IMAGE_SAFETY_MODEL=os.getenv('IMAGE_SAFETY_MODEL','openai/gpt-4.1-mini').strip()
 IMAGE_QUALITY=os.getenv('IMAGE_QUALITY','high').strip()
 if IMAGE_QUALITY not in ('auto','low','medium','high'):
@@ -2185,7 +2186,11 @@ def image_error_detail(raw,prompt=''):
     except (ValueError,TypeError):
         return ''
     error=data.get('error') if isinstance(data,dict) else None
+    if not error and isinstance(data,dict) and isinstance(data.get('errors'),list) and data['errors']:
+        error=data['errors'][0]
     text=error.get('message') if isinstance(error,dict) else error
+    if isinstance(error,dict) and isinstance(error.get('code'),int) and isinstance(text,str):
+        text=f"[{error['code']}] {text}"
     if not isinstance(text,str):
         return ''
     for secret in (IMAGE_API_KEY,OPENROUTER_API_KEY,TELEGRAM_BOT_TOKEN,PAYMENT_BOT_TOKEN,GROQ_API_KEY,prompt):
@@ -2212,22 +2217,30 @@ def image_error_reason(text):
     return 'unspecified'
 
 
-async def fetch_generated_image(prompt):
-    # Pollinations only. A separate key, no automatic retries or fallback billing.
-    import json
+def image_configuration_error():
     if not IMAGE_API_KEY:
-        raise ValueError('IMAGE_API_KEY missing')
-    payload={'model':IMAGE_MODEL,'prompt':prompt,'n':1,'size':'1024x1024',
-             'response_format':'b64_json','safe':'privacy,secrets,sexual,violence'}
-    # Quality is an OpenAI Images parameter, not a universal model parameter.
-    if IMAGE_MODEL.startswith('openai/gpt-image-'):
-        payload['quality']='medium' if IMAGE_QUALITY=='auto' else IMAGE_QUALITY
+        return 'Добавь токен Cloudflare в Railway → Variables → IMAGE_API_KEY.'
+    if not re.fullmatch(r'[0-9a-fA-F]{32}',CLOUDFLARE_ACCOUNT_ID):
+        return 'Укажи CLOUDFLARE_ACCOUNT_ID: 32 символа Account ID, не адрес страницы.'
+    if IMAGE_MODEL!='@cf/black-forest-labs/flux-1-schnell':
+        return 'Поставь IMAGE_MODEL = @cf/black-forest-labs/flux-1-schnell в Railway и перезапусти бот.'
+    return ''
+
+
+async def fetch_generated_image(prompt):
+    # Direct Cloudflare REST. No Pollinations request, paid fallback or retry.
+    import json
+    config_error=image_configuration_error()
+    if config_error:
+        raise ValueError(config_error)
+    url=f'https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/ai/run/{IMAGE_MODEL}'
+    payload={'prompt':prompt,'steps':4}
     async with httpx.AsyncClient(timeout=httpx.Timeout(180,connect=10),follow_redirects=False) as http:
-        async with http.stream('POST','https://gen.pollinations.ai/v1/images/generations',
+        async with http.stream('POST',url,
             headers={'Authorization':'Bearer '+IMAGE_API_KEY,'Accept':'application/json'},json=payload) as response:
             raw=bytearray()
+            content_type=response.headers.get('content-type','').split(';')[0].strip().lower()
             if response.is_error:
-                # Read a bounded error body before raise_for_status closes the stream.
                 async for chunk in response.aiter_bytes():
                     raw.extend(chunk[:max(0,65536-len(raw))])
                     if len(raw)>=65536:
@@ -2243,11 +2256,53 @@ async def fetch_generated_image(prompt):
                 raw.extend(chunk)
                 if len(raw)>IMAGE_MAX_RESPONSE:
                     raise ValueError('Image response too large')
+    if content_type in ('image/png','image/jpeg','image/webp'):
+        return await asyncio.to_thread(safe_image_bytes,bytes(raw))
     data=json.loads(raw)
-    encoded=data['data'][0]['b64_json']
+    if not isinstance(data,dict):
+        raise ValueError('Invalid image response')
+    if data.get('success') is False:
+        exc=ValueError('Image API returned success=false')
+        exc.image_api_detail=image_error_detail(raw,prompt)
+        exc.image_api_reason=image_error_reason(exc.image_api_detail)
+        raise exc
+    result=data.get('result')
+    encoded=result.get('image') if isinstance(result,dict) else None
     if not isinstance(encoded,str) or len(encoded)>20*1024*1024:
         raise ValueError('Invalid image response')
     return await asyncio.to_thread(safe_image_bytes,base64.b64decode(encoded,validate=True))
+
+
+IMAGE_PROGRESS_FRAMES=('● • •','• ● •','• • ●','• ● •')
+IMAGE_PROGRESS_INTERVAL=1.8
+
+
+def image_progress_text(frame):
+    return f'🎨 Картинка генерируется\n\n{IMAGE_PROGRESS_FRAMES[frame % len(IMAGE_PROGRESS_FRAMES)]}\n\nГотовую картинку пришлю сюда.'
+
+
+async def animate_image_progress(bot,chat_id,message_id):
+    frame=1
+    while True:
+        await asyncio.sleep(IMAGE_PROGRESS_INTERVAL)
+        try:
+            await bot.edit_message_text(chat_id=chat_id,message_id=message_id,
+                                        text=image_progress_text(frame),parse_mode=None)
+        except TelegramRetryAfter as exc:
+            # Respect Telegram rate limits. The main generation is not retried.
+            await asyncio.sleep(max(1,float(exc.retry_after)))
+            continue
+        except (TelegramAPIError,asyncio.TimeoutError,OSError):
+            # Cosmetic UI failure must not cancel an already paid image request.
+            return
+        if frame % 3==0:
+            try:
+                await bot.send_chat_action(chat_id=chat_id,action=ChatAction.UPLOAD_PHOTO)
+            except TelegramRetryAfter as exc:
+                await asyncio.sleep(max(1,float(exc.retry_after)))
+            except (TelegramAPIError,asyncio.TimeoutError,OSError):
+                pass
+        frame+=1
 
 
 async def generate_image(message,uid,prompt,voice_handoff=False):
@@ -2270,9 +2325,9 @@ async def generate_image(message,uid,prompt,voice_handoff=False):
     if is_cheat_code_request(prompt):
         await message.answer(CHEAT_CODE_REPLY,parse_mode=None)
         return
-    if not IMAGE_API_KEY:
-        await message.answer('🎨 Добавь ключ Pollinations в Railway → Variables → IMAGE_API_KEY и перезапусти бот.'
-                             if uid==OWNER_ID else '🎨 Генерация пока недоступна.')
+    config_error=image_configuration_error()
+    if config_error:
+        await message.answer('🎨 '+config_error if uid==OWNER_ID else '🎨 Генерация пока недоступна.')
         return
     if client is None or not IMAGE_MODEL or not IMAGE_SAFETY_MODEL:
         await message.answer('🎨 Генерация пока недоступна.')
@@ -2284,6 +2339,7 @@ async def generate_image(message,uid,prompt,voice_handoff=False):
     reservation=None
     delivered=False
     progress=None
+    progress_task=None
     stage='quota'
     try:
         permit=await eco('reserve',uid,{'image':True,'voice_handoff':voice_handoff})
@@ -2294,7 +2350,10 @@ async def generate_image(message,uid,prompt,voice_handoff=False):
                 await message.answer('🎨 Нет доступных генераций. Выбери пакет в магазине или дождись бесплатного пополнения, если оно есть у твоей роли.',reply_markup=InlineKeyboardMarkup(inline_keyboard=[[button('🛍 Пакеты картинок','ui:shop')]]))
             return
         reservation=permit['reservation']
-        progress=await message.answer('🎨 Готовлю картинку…')
+        progress=await message.answer(image_progress_text(0),parse_mode=None)
+        progress_id=getattr(progress,'message_id',None)
+        if isinstance(progress_id,int) and progress_id>0:
+            progress_task=asyncio.create_task(animate_image_progress(message.bot,uid,progress_id))
         stage='safety'
         decision=await check_image_prompt(prompt)
         if decision=='BLOCK':
@@ -2326,20 +2385,24 @@ async def generate_image(message,uid,prompt,voice_handoff=False):
         logging.warning('Image generation failed: stage=%s model=%s type=%s status=%s',stage,
             IMAGE_SAFETY_MODEL if stage=='safety' else IMAGE_MODEL,type(exc).__name__,status)
         if uid==OWNER_ID:
-            hint={401:'Проверь API-ключ.',402:'Проверь баланс Pollen и бюджет ключа Pollinations.' if stage=='generation' else 'Проверь кредит API проверки запроса.',
+            hint={401:'Проверь API-ключ.',402:'Проверь доступ и квоту Workers AI.' if stage=='generation' else 'Проверь кредит API проверки запроса.',
                   403:'У ключа нет доступа или запрос отклонён сервисом.',404:'Модель или маршрут API недоступны.',
-                  429:'Лимит запросов API — попробуй позже.'}.get(status,'Посмотри строку Image generation failed в логах.')
+                  429:'Достигнут лимит запросов или квота API. Проверь Workers AI и попробуй позже.'}.get(status,'Посмотри строку Image generation failed в логах.')
             detail=getattr(exc,'image_api_detail','')
             reason=getattr(exc,'image_api_reason','unspecified')
             # Body is shown only to configured Owner, not copied into shared logs.
             logging.warning('Image API diagnostic: stage=%s status=%s reason=%s has_detail=%s',stage,status,reason,bool(detail))
             if detail:
-                await message.answer(f'🎨 API отказал · код {status}.\nОтвет API: {detail}',parse_mode=None)
+                await message.answer(f'🎨 API отказал · код {status or "API"}.\nОтвет API: {detail}',parse_mode=None)
             else:
                 await message.answer(f'🎨 Пока недоступно. Этап: {stage} · код: {status or type(exc).__name__}.\n{hint}')
         else:
             await message.answer('🎨 Генерация пока недоступна.')
     finally:
+        if progress_task is not None:
+            progress_task.cancel()
+            with suppress(asyncio.CancelledError,Exception):
+                await progress_task
         in_flight-=1
         if reservation:
             await eco('commit' if delivered else 'release',uid,reservation)
@@ -3399,7 +3462,7 @@ async def main():
                 BotCommand(command="terms", description="📜 Условия"),
                 BotCommand(command="paysupport", description="🛟 Помощь с покупкой"),
             ])
-        logging.warning("Gosha v44 Pollinations image API; invitation rewards cap 8m; shared tokens, referrals, shop and maintenance; bots=%s payments=%s owner_has_no_quota=True", len(bots), payments_ready())
+        logging.warning("Gosha v46 Cloudflare image API; waiting animation; invitation rewards cap 8m; shared tokens, referrals, shop and maintenance; bots=%s payments=%s owner_has_no_quota=True", len(bots), payments_ready())
         if not payments_ready():
             logging.warning("Payment setup checks failed: %s", ", ".join(name for name, ok, _ in payment_checks() if not ok))
         await dp.start_polling(*bots, allowed_updates=["message", "callback_query", "pre_checkout_query", "chat_member", "my_chat_member"])
