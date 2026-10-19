@@ -353,6 +353,11 @@ def db_init():
             lease_until REAL NOT NULL DEFAULT 0, attempts INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY(campaign_key,user_id,pass_no));
         CREATE INDEX IF NOT EXISTS move_due ON move_deliveries(state,next_attempt);
+        CREATE TABLE IF NOT EXISTS bot_bans (
+            user_id INTEGER PRIMARY KEY, banned_by INTEGER NOT NULL, banned_at REAL NOT NULL);
+        CREATE TABLE IF NOT EXISTS ban_confirmations (
+            token TEXT PRIMARY KEY, owner_id INTEGER NOT NULL, user_id INTEGER NOT NULL,
+            expires_at REAL NOT NULL);
         CREATE TABLE IF NOT EXISTS bot_members (user_id INTEGER PRIMARY KEY, username TEXT);
         CREATE TABLE IF NOT EXISTS friend_roles (
             user_id INTEGER PRIMARY KEY, granted_by INTEGER NOT NULL, granted_at REAL NOT NULL
@@ -398,12 +403,46 @@ def db_run(action, uid=0, value=None):
     day = datetime.now(timezone.utc).date().isoformat()
     now = time.time()
     with closing(sqlite3.connect(DB, timeout=10)) as con, con:
+        if action == "ban_status":
+            return bool(uid != OWNER_ID and con.execute("SELECT 1 FROM bot_bans WHERE user_id=?", (uid,)).fetchone())
+        if action in ("ban_prepare", "ban_confirm", "unban"):
+            if OWNER_ID <= 0 or uid != OWNER_ID:
+                raise PermissionError("Owner only")
+            con.execute("BEGIN IMMEDIATE")
+            if action == "ban_confirm":
+                row = con.execute("SELECT user_id FROM ban_confirmations WHERE token=? AND owner_id=? AND expires_at>?", (str(value),uid,now)).fetchone()
+                if not row:
+                    return {"state":"invalid"}
+                target = row[0]
+                con.execute("DELETE FROM ban_confirmations WHERE token=?", (str(value),))
+            else:
+                target = int(value['target'] if action == "ban_prepare" else value)
+            if not 0 < target <= 2**52-1 or target == OWNER_ID:
+                return {"state":"invalid"}
+            if action == "unban":
+                changed = con.execute("DELETE FROM bot_bans WHERE user_id=?", (target,)).rowcount
+                if changed:
+                    con.execute("INSERT OR IGNORE INTO bot_members(user_id) VALUES(?)", (target,))
+                return {"state":"unbanned" if changed else "not_banned", "target":target}
+            if not con.execute("SELECT 1 FROM bot_members WHERE user_id=?", (target,)).fetchone():
+                return {"state":"unknown"}
+            if con.execute("SELECT 1 FROM bot_bans WHERE user_id=?", (target,)).fetchone():
+                return {"state":"already_banned", "target":target}
+            if action == "ban_prepare":
+                con.execute("DELETE FROM ban_confirmations WHERE expires_at<=?", (now,))
+                con.execute("INSERT INTO ban_confirmations VALUES(?,?,?,?)", (value['token'],uid,target,now+600))
+                return {"state":"prepared", "target":target}
+            con.execute("INSERT INTO bot_bans VALUES(?,?,?)", (target,uid,now))
+            con.execute("DELETE FROM ban_confirmations WHERE user_id=?", (target,))
+            con.execute("UPDATE move_deliveries SET state='cancelled',claim_token=NULL,lease_until=0 WHERE user_id=? AND state='pending'", (target,))
+            con.execute("UPDATE name_notice_v28 SET state='blocked',token=NULL,lease_until=0 WHERE user_id=? AND state='pending'", (target,))
+            return {"state":"banned", "target":target}
         if action in ("friend_grant", "friend_revoke", "friend_list"):
             if OWNER_ID <= 0 or uid != OWNER_ID:
                 raise PermissionError("Owner only")
             con.execute("BEGIN IMMEDIATE")
             if action == "friend_list":
-                return con.execute("SELECT user_id FROM friend_roles ORDER BY user_id LIMIT 50").fetchall()
+                return con.execute("SELECT user_id FROM friend_roles WHERE user_id NOT IN (SELECT user_id FROM bot_bans) ORDER BY user_id LIMIT 50").fetchall()
             target = int(value)
             if target <= 0 or target > 2**52-1 or target == OWNER_ID:
                 return "invalid"
@@ -438,11 +477,11 @@ def db_run(action, uid=0, value=None):
             if OWNER_ID <= 0 or uid != OWNER_ID:
                 raise PermissionError("Owner-only roster")
             if action == "member":
-                return con.execute("SELECT user_id,username FROM bot_members WHERE user_id=?", (int(value),)).fetchone()
-            total = con.execute("SELECT COUNT(*) FROM bot_members").fetchone()[0]
+                return con.execute("SELECT user_id,username FROM bot_members WHERE user_id=? AND user_id NOT IN (SELECT user_id FROM bot_bans)", (int(value),)).fetchone()
+            total = con.execute("SELECT COUNT(*) FROM bot_members WHERE user_id NOT IN (SELECT user_id FROM bot_bans)").fetchone()[0]
             pages = max(1, (total + OWNER_PAGE_SIZE - 1) // OWNER_PAGE_SIZE)
             page = min(max(0, int(value or 0)), pages - 1)
-            rows = con.execute("SELECT user_id,username FROM bot_members ORDER BY user_id LIMIT ? OFFSET ?", (OWNER_PAGE_SIZE, page * OWNER_PAGE_SIZE)).fetchall()
+            rows = con.execute("SELECT user_id,username FROM bot_members WHERE user_id NOT IN (SELECT user_id FROM bot_bans) ORDER BY user_id LIMIT ? OFFSET ?", (OWNER_PAGE_SIZE, page * OWNER_PAGE_SIZE)).fetchall()
             return {"rows": rows, "total": total, "page": page, "pages": pages}
         if action == "asset_get":
             row = con.execute("SELECT avatar_hash FROM bot_assets WHERE bot_id=?", (uid,)).fetchone()
@@ -451,6 +490,7 @@ def db_run(action, uid=0, value=None):
             con.execute("INSERT INTO bot_assets VALUES(?,?) ON CONFLICT(bot_id) DO UPDATE SET avatar_hash=excluded.avatar_hash", (uid, value))
             return
         if action == "cleanup":
+            con.execute("DELETE FROM ban_confirmations WHERE expires_at<=?", (now,))
             con.execute("DELETE FROM messages WHERE created < ?", (now - 30 * 86400,))
             con.execute("DELETE FROM usage WHERE day < ?", (day,))
             return
@@ -464,6 +504,7 @@ def db_run(action, uid=0, value=None):
         elif action == "reset":
             con.execute("DELETE FROM messages WHERE user_id=?", (uid,))
         elif action == "delete":
+            con.execute("DELETE FROM ban_confirmations WHERE user_id=?", (uid,))
             con.execute("DELETE FROM move_deliveries WHERE user_id=?", (uid,))
             con.execute("DELETE FROM friend_roles WHERE user_id=?", (uid,))
             con.execute("DELETE FROM name_notice_v28 WHERE user_id=?", (uid,))
@@ -552,14 +593,51 @@ class UserLockMiddleware(BaseMiddleware):
                 self.entries.pop(user.id, None)
 
 
+BAN_MESSAGE = "🚫 Доступ к боту заблокирован. По вопросам — /support."
+
+
+class BanMiddleware(BaseMiddleware):
+    safe_commands = frozenset({"support", "paysupport", "privacy", "terms", "paymentstatus", "myid", "reset", "delete"})
+    safe_callbacks = frozenset({"ui:support", "ui:privacy", "ui:privacy_details", "ui:terms", "ui:paymentstatus"})
+
+    async def __call__(self, handler, event, data):
+        if isinstance(event, Message) and (event.successful_payment or event.refunded_payment):
+            return await handler(event, data)
+        if not isinstance(event, (Message, CallbackQuery)):
+            return await handler(event, data)
+        message = event if isinstance(event, Message) else event.message
+        user = getattr(event, "from_user", None)
+        if message is None or message.chat.type != ChatType.PRIVATE or not user or user.is_bot:
+            return await handler(event, data)
+        if not await store("ban_status", user.id):
+            return await handler(event, data)
+        if isinstance(event, Message):
+            text = (event.text or "").strip()
+            command = text.split()[0].split("@",1)[0][1:].lower() if text.startswith("/") else ""
+            if command in self.safe_commands:
+                return await handler(event, data)
+            # Existing human support replies stay human; they must never go to AI.
+            if await support_service.consume(event):
+                return None
+        elif event.data in self.safe_callbacks or (event.data or "").startswith("sup:"):
+            return await handler(event, data)
+        await message.answer(BAN_MESSAGE, parse_mode=None)
+        return None
+
+
+ban_gate = BanMiddleware()
 user_lock = UserLockMiddleware()
 router.message.outer_middleware(user_lock)
 router.callback_query.outer_middleware(user_lock)
+router.message.outer_middleware(ban_gate)
 router.message.outer_middleware(SupportMiddleware(support_service))
+router.callback_query.outer_middleware(ban_gate)
 router.callback_query.outer_middleware(SupportMiddleware(support_service))
 pay_router.message.outer_middleware(user_lock)
 pay_router.callback_query.outer_middleware(user_lock)
+pay_router.message.outer_middleware(ban_gate)
 pay_router.message.outer_middleware(SupportMiddleware(support_service))
+pay_router.callback_query.outer_middleware(ban_gate)
 pay_router.callback_query.outer_middleware(SupportMiddleware(support_service))
 
 
@@ -721,7 +799,7 @@ class ChannelSubscriptionMiddleware(BaseMiddleware):
     # Service, data controls, human support and financial records stay accessible.
     safe_commands = frozenset({"support", "paysupport", "tickets", "privacy", "terms", "help",
                                "myid", "role", "reset", "delete", "paymentstatus", "reply",
-                               "stars", "payments", "refund", "friend", "unfriend", "friends", "plus", "pro", "channelstatus", "announce_move", "move_status", "cancel_move"})
+                               "stars", "payments", "refund", "friend", "unfriend", "friends", "plus", "pro", "channelstatus", "announce_move", "move_status", "cancel_move", "unban"})
     safe_callbacks = frozenset({"channel:check", "payment:agree", "ui:pro", "pro:buy", "ui:support", "ui:privacy", "ui:privacy_details",
                                 "ui:terms", "ui:help", "ui:help_details", "ui:paymentstatus"})
 
@@ -955,6 +1033,7 @@ PRIVACY_DETAILS = (
     "/reset — стереть переписку. /delete — также настройки и согласие. "
     "Активный оплаченный доступ, записи платежей, временные антиспам-счётчики сохраняются. "
     "Старый дневной счётчик предыдущей версии очищается после смены дня UTC.\n\n"
+    "При бане Telegram ID сохраняется для ограничения доступа; /delete не снимает бан. "
     "Это не удаляет копии у Telegram и провайдеров. Самоподтверждение 16+ не заменяет "
     "проверку документов. По данным и платежам: кнопка «Поддержка» или /support. Обращения и вложения получает владелец; они не отправляются ИИ. В базе сохраняются только номера обращений и маршруты ответов до 30 дней; копии переписки остаются в Telegram."
 )
@@ -1003,6 +1082,7 @@ PRIVACY = (
     "<b>🔒 О данных — коротко</b>\n\n"
     "• Текст, фото задачи и до 24 прошлых сообщений передаются внешнему ИИ-сервису и провайдеру модели.\n"
     "• Голосовые передаются сервису распознавания, расшифровка — ИИ. Записи голоса и фото не хранятся в базе; текст и ответы сохраняются. Не присылай секреты.\n"
+    "• При бане сохраняется Telegram ID для блокировки доступа; /delete не снимает бан.\n"
     "• /reset — забыть диалог; /delete — удалить также настройки и согласие. Платежи, оплаченный доступ и временные счётчики сохраняются.\n"
     "• Поддержку читает владелец, не ИИ. /delete удаляет номера обращений в базе, но не копии в Telegram и у провайдеров."
 )
@@ -1216,6 +1296,9 @@ async def notify_owner(bot_instance, text):
 async def checkout(query: PreCheckoutQuery):
     # No chat lock/AI await on this path: Telegram requires an answer within 10 sec.
     try:
+        if await store("ban_status", query.from_user.id):
+            await query.answer(ok=False, error_message="Доступ к боту заблокирован. По оплате обратись в /paysupport.")
+            return
         row = await store("get", query.from_user.id)
         ok = bool(payments_ready() and row and row[0] and await bill(
             "precheck", query.from_user.id,
@@ -1628,7 +1711,7 @@ def move_db(action, sender_id, value=None):
                 return "exists" if campaign[0] == sender_id else "other_sender"
             con.execute("INSERT INTO move_campaigns VALUES(?,?,?,?,?)", (MOVE_KEY, sender_id, now, MOVE_TARGET, "active"))
             for n, delay in enumerate(MOVE_OFFSETS, 1):
-                con.execute("INSERT INTO move_deliveries(campaign_key,user_id,pass_no,scheduled_at,next_attempt) SELECT ?,user_id,?,?,? FROM bot_members WHERE user_id>0", (MOVE_KEY, n, now+delay, now+delay))
+                con.execute("INSERT INTO move_deliveries(campaign_key,user_id,pass_no,scheduled_at,next_attempt) SELECT ?,user_id,?,?,? FROM bot_members WHERE user_id>0 AND user_id NOT IN (SELECT user_id FROM bot_bans)", (MOVE_KEY, n, now+delay, now+delay))
             return "started"
         if not campaign or campaign[0] != sender_id:
             return None
@@ -1800,6 +1883,9 @@ async def generate(message, uid, text, photo=None, image_requested=False, voice=
     if len(text) > input_limit:
         await message.answer(f"Сократи до {input_limit} символов.")
         return
+    if await store("ban_status", uid):
+        await message.answer(BAN_MESSAGE, parse_mode=None)
+        return
     if in_flight >= MAX_CONCURRENT:
         await message.answer("Перегрузка. Попробуй чуть позже — запрос не списан.")
         return
@@ -1913,6 +1999,9 @@ async def generate(message, uid, text, photo=None, image_requested=False, voice=
         if is_blocked_game_output(answer):
             await message.answer(CHEAT_CODE_REPLY, parse_mode=None)
             return
+        if await store("ban_status", uid):
+            await message.answer(BAN_MESSAGE, parse_mode=None)
+            return
         answer = public_model_text(answer)
         # 1800 code points fit Telegram's UTF-16 limit even for all-emoji answers.
         for offset in range(0, len(answer), 1800):
@@ -1925,6 +2014,21 @@ async def generate(message, uid, text, photo=None, image_requested=False, voice=
         in_flight -= 1
         if reservation is not None and not delivered:
             await bill("release", uid, reservation)
+
+
+@router.message(Command("unban"))
+async def unban_handler(message: Message):
+    owner = message.from_user.id
+    if not owner_admin_allowed(message, owner):
+        await message.answer("⛔ Команда только для владельца в личке с ботом.")
+        return
+    parts = (message.text or "").split()
+    if len(parts) != 2 or not parts[1].isascii() or not parts[1].isdecimal() or len(parts[1]) > 16 or not 0 < int(parts[1]) <= 2**52-1:
+        await message.answer("Напиши: /unban TELEGRAM_ID")
+        return
+    target = int(parts[1])
+    result = await store("unban", owner, target)
+    await message.answer(f"✅ Пользователь {target} разбанен и снова отображается в списке." if result['state'] == "unbanned" else "У этого пользователя нет бана.", parse_mode=None)
 
 
 @router.message(F.text.startswith("/"))
@@ -1986,7 +2090,8 @@ async def show_bot_admin(message, uid, page=0, edit=False):
             f"\n\n📄 Страница {page + 1}/{roster['pages']}\n"
             "— = юзернейм не указан или пока неизвестен.\n"
             "🎁 Подарить Плюс на сутки · ⊖ Снять Плюс с подтверждением.\n"
-            "🫶 Friend: /friend ID · /unfriend ID · /friends")
+            "🫶 Friend: /friend ID · /unfriend ID · /friends\n"
+            "🚫 Бан — в карточке пользователя. Разбан: /unban ID")
     rows = []
     for recipient_id, username in roster['rows']:
         label = ("@" + username) if username else "Без юзернейма"
@@ -2051,9 +2156,65 @@ async def admin_member_callback(query: CallbackQuery):
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [button("🎁 Плюс на 1 день", f"admin:giftstart:{target}:{page}"),
          button("⊖ Снять Плюс", f"admin:revokestart:{target}:{page}")],
+        *([[button("🚫 Забанить", f"admin:banstart:{target}:{page}")]] if target != OWNER_ID else []),
         [button("← К списку", f"admin:users:{page}")],
     ])
     await query.message.answer(text, parse_mode=None, reply_markup=keyboard)
+
+
+@router.callback_query(F.data.startswith("admin:banstart:"))
+async def admin_ban_start(query: CallbackQuery):
+    owner = query.from_user.id
+    if not owner_admin_allowed(query.message, owner):
+        await query.message.answer("⛔ Только для владельца.")
+        return
+    parts = query.data.split(":")
+    if len(parts) != 4 or not parts[2].isascii() or not parts[2].isdecimal() or len(parts[2]) > 16:
+        await query.message.answer("Открой меню заново: /menu.")
+        return
+    target, page = int(parts[2]), admin_page(parts[3])
+    if not 0 < target <= 2**52-1 or target == OWNER_ID or page is None:
+        await query.message.answer("Этого пользователя забанить нельзя.")
+        return
+    token = secrets.token_urlsafe(16)
+    result = await store("ban_prepare", owner, {"target":target,"token":token})
+    if result['state'] != "prepared":
+        await query.message.answer("Пользователь не найден или уже забанен. Обнови список.")
+        return
+    text = (f"🚫 Забанить пользователя {target}?\n\nОн потеряет доступ к ИИ и исчезнет из списка. "
+            f"Разбан — только командой /unban {target}.\nБан не оформляет возврат и не меняет оплаченный срок.")
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [button("🚫 Да, забанить", f"admin:banconfirm:{token}:{page}")],
+        [button("Отмена", f"admin:member:{target}:{page}")],
+    ])
+    await query.message.answer(text, parse_mode=None, reply_markup=keyboard)
+
+
+@router.callback_query(F.data.startswith("admin:banconfirm:"))
+async def admin_ban_confirm(query: CallbackQuery):
+    owner = query.from_user.id
+    if not owner_admin_allowed(query.message, owner):
+        await query.message.answer("⛔ Только для владельца.")
+        return
+    parts = query.data.split(":")
+    if len(parts) != 4 or not re.fullmatch(r"[A-Za-z0-9_-]{16,64}", parts[2]):
+        await query.message.answer("Открой меню заново: /menu.")
+        return
+    page = admin_page(parts[3])
+    if page is None:
+        await query.message.answer("Открой меню заново: /menu.")
+        return
+    result = await store("ban_confirm", owner, parts[2])
+    if result['state'] != "banned":
+        await query.message.answer("Подтверждение устарело или бан уже применён. Обнови список.")
+        return
+    target = result['target']
+    await query.message.answer(f"🚫 Пользователь {target} забанен.\nРазбан: /unban {target}", parse_mode=None)
+    try:
+        await query.message.edit_reply_markup(reply_markup=None)
+    except TelegramAPIError:
+        pass
+    await show_bot_admin(query.message, owner, page)
 
 
 @router.callback_query(F.data.startswith("admin:users:"))
@@ -2383,6 +2544,7 @@ pay_router.message.register(tickets_handler, Command("tickets"))
 pay_router.callback_query.register(ui_callback, F.data.startswith("ui:"))
 pay_router.message.register(owner_handler, Command("reply", "stars", "payments", "refund"))
 pay_router.message.register(friend_handler, Command("friend", "unfriend", "friends"))
+pay_router.message.register(unban_handler, Command("unban"))
 pay_router.message.register(payment_status_handler, Command("paymentstatus"))
 pay_router.message.register(myid_handler, Command("myid"))
 pay_router.message.register(role_handler, Command("role"))
@@ -2625,7 +2787,7 @@ async def main():
                 BotCommand(command="terms", description="📜 Условия"),
                 BotCommand(command="paysupport", description="🛟 Помощь с покупкой"),
             ])
-        logging.warning("Gosha v35 safe owner panel; bots=%s payments=%s owner_has_no_quota=True", len(bots), payments_ready())
+        logging.warning("Gosha v36 owner bans; bots=%s payments=%s owner_has_no_quota=True", len(bots), payments_ready())
         if not payments_ready():
             logging.warning("Payment setup checks failed: %s", ", ".join(name for name, ok, _ in payment_checks() if not ok))
         await dp.start_polling(*bots, allowed_updates=["message", "callback_query", "pre_checkout_query", "chat_member", "my_chat_member"])
