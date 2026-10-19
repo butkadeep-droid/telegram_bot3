@@ -1990,7 +1990,7 @@ async def show_bot_admin(message, uid, page=0, edit=False):
     rows = []
     for recipient_id, username in roster['rows']:
         label = ("@" + username) if username else "Без юзернейма"
-        rows.append([InlineKeyboardButton(text=f"👤 {label} · {recipient_id}", url=f"tg://user?id={recipient_id}"),
+        rows.append([button(f"👤 {label} · {recipient_id}", f"admin:member:{recipient_id}:{page}"),
                      button("🎁 Плюс на 1 день", f"admin:giftstart:{recipient_id}:{page}"),
                      button("⊖ Снять Плюс", f"admin:revokestart:{recipient_id}:{page}")])
     nav = []
@@ -2010,14 +2010,50 @@ async def show_bot_admin(message, uid, page=0, edit=False):
         except TelegramBadRequest as error:
             if "message is not modified" in error.message.lower():
                 return
-            logging.warning("Admin roster edit not applied; sending a fresh table")
-    await message.answer(text, parse_mode="HTML", reply_markup=keyboard)
+            logging.warning("Admin roster edit failed: reason=%s", safe_telegram_reason(error))
+    try:
+        await message.answer(text, parse_mode="HTML", reply_markup=keyboard)
+    except TelegramBadRequest as exc:
+        logging.warning("Admin roster send failed: reason=%s", safe_telegram_reason(exc))
+        # Still deliver the roster if Telegram rejects a keyboard or formatting.
+        lines = [f"👑 Меню бота · Пользователи: {roster['total']}"]
+        lines.extend(f"{'@'+name if name else 'Без юзернейма'} · ID {target}" for target, name in roster['rows'])
+        lines.append("Кнопки временно недоступны. Вернуться: /menu")
+        await message.answer("\n".join(lines), parse_mode=None)
 
 
 def admin_page(text):
     if not text.isascii() or not text.isdecimal() or len(text) > 10:
         return None
     return int(text)
+
+
+@router.callback_query(F.data.startswith("admin:member:"))
+async def admin_member_callback(query: CallbackQuery):
+    uid = query.from_user.id
+    if not owner_admin_allowed(query.message, uid):
+        await query.message.answer("⛔ Это меню доступно только владельцу.")
+        return
+    parts = query.data.split(":")
+    if len(parts) != 4 or not parts[2].isascii() or not parts[2].isdecimal() or len(parts[2]) > 16:
+        await query.message.answer("Открой меню заново: /menu.")
+        return
+    target, page = int(parts[2]), admin_page(parts[3])
+    if target <= 0 or target > 2**52-1 or page is None:
+        await query.message.answer("Открой меню заново: /menu.")
+        return
+    member = await store("member", uid, target)
+    if not member:
+        await query.message.answer("Пользователь больше не найден. Обнови список: /menu.")
+        return
+    label = "@" + member[1] if member[1] else "Юзернейм не указан"
+    text = f"👤 Пользователь\n\n{label}\nID: {target}"
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [button("🎁 Плюс на 1 день", f"admin:giftstart:{target}:{page}"),
+         button("⊖ Снять Плюс", f"admin:revokestart:{target}:{page}")],
+        [button("← К списку", f"admin:users:{page}")],
+    ])
+    await query.message.answer(text, parse_mode=None, reply_markup=keyboard)
 
 
 @router.callback_query(F.data.startswith("admin:users:"))
@@ -2224,13 +2260,18 @@ async def ui_callback(query: CallbackQuery):
 
 
 async def errors(event):
-    logging.error("Handler failure: %s", type(event.exception).__name__)
+    exc = event.exception
+    if isinstance(exc, TelegramAPIError):
+        logging.error("Handler failure: %s method=%s reason=%s", type(exc).__name__,
+                      type(getattr(exc, "method", None)).__name__, safe_telegram_reason(exc))
+    else:
+        logging.error("Handler failure: %s", type(exc).__name__)
     message = event.update.message
     if message is None and event.update.callback_query is not None:
         message = event.update.callback_query.message
     if message is not None and message.chat.type == ChatType.PRIVATE:
         try:
-            await message.answer(ERROR_MESSAGE)
+            await message.answer("Не удалось выполнить действие. Попробуй ещё раз.")
         except Exception:
             logging.error("Could not deliver failure notification")
     return True
@@ -2410,7 +2451,7 @@ _NAME_RETRY_AT = {}
 def safe_telegram_reason(exc):
     # Log the Telegram description only; never a request or credential object.
     reason = str(getattr(exc, "message", "") or type(exc).__name__)
-    for secret in (TELEGRAM_BOT_TOKEN, PAYMENT_BOT_TOKEN, OPENROUTER_API_KEY):
+    for secret in (TELEGRAM_BOT_TOKEN, PAYMENT_BOT_TOKEN, OPENROUTER_API_KEY, GROQ_API_KEY):
         if secret:
             reason = reason.replace(secret, "[redacted]")
     reason = re.sub(r"\b\d{5,}:[A-Za-z0-9_-]{15,}", "[redacted]", reason)
@@ -2584,7 +2625,7 @@ async def main():
                 BotCommand(command="terms", description="📜 Условия"),
                 BotCommand(command="paysupport", description="🛟 Помощь с покупкой"),
             ])
-        logging.warning("Gosha v34 migration, multilingual and voice; bots=%s payments=%s owner_has_no_quota=True", len(bots), payments_ready())
+        logging.warning("Gosha v35 safe owner panel; bots=%s payments=%s owner_has_no_quota=True", len(bots), payments_ready())
         if not payments_ready():
             logging.warning("Payment setup checks failed: %s", ", ".join(name for name, ok, _ in payment_checks() if not ok))
         await dp.start_polling(*bots, allowed_updates=["message", "callback_query", "pre_checkout_query", "chat_member", "my_chat_member"])
