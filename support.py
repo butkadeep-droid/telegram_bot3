@@ -389,6 +389,6 @@ class SupportMiddleware(BaseMiddleware):
             if (event.data or '').startswith('sup:'):
                 await self.service.callback(event);return
             # Any navigation back into normal bot workflow exits support compose mode.
-            if (event.data or '').startswith(('ui:','mode:','pro:','admin:')):
+            if (event.data or '').startswith(('ui:','mode:','pro:','admin:','shop:','credit:','maintenance:')):
                 await self.service.call('clear',bid=event.message.bot.id,uid=event.from_user.id)
         return await handler(event,data)
