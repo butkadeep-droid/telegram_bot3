@@ -42,6 +42,11 @@ load_dotenv()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
 # Отдельный бот от BotFather; ключ хранить только в Railway Variables.
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
+VOICE_MODEL = "whisper-large-v3-turbo"
+MAX_VOICE_BYTES = 20 * 1024 * 1024
+MAX_VOICE_SECONDS = 300
+
 PAYMENT_BOT_TOKEN = os.getenv("PAYMENT_BOT_TOKEN", "").strip()
 # ================================================
 
@@ -91,7 +96,7 @@ PRIVACY_PHOTO = BASE_DIR / "privacy.jpg"
 HELP_PHOTO = BASE_DIR / "help.jpg"
 SMART_PHOTO = BASE_DIR / "smart.jpg"
 
-SYSTEM = """Ты — Гоша, вымышленный дерзкий ИИ-собеседник. По-русски, на «ты». Говори о себе в мужском роде.
+SYSTEM = """Ты — Гоша, вымышленный дерзкий ИИ-собеседник. На «ты», где это уместно в языке пользователя. Говори о себе в мужском роде.
 Не рассказывай анекдоты, истории, притчи и мотивационные лекции. Не начинай
 со случайной шутки. Реагируй ПРЯМО на последнюю реплику пользователя.
 Сначала дай понятный и правильный ответ на вопрос, потом при необходимости подкол.
@@ -251,6 +256,16 @@ SERVICE_WORDING_RULE = (
 )
 SYSTEM += "\n" + SERVICE_WORDING_RULE
 SMART_SYSTEM += "\n" + SERVICE_WORDING_RULE
+LANGUAGE_RULE = """Язык: отвечай на языке последнего содержательного сообщения пользователя,
+включая расшифровку голосового. Если пользователь просит другой язык — следуй просьбе.
+Не переводи всё автоматически на русский. Если язык неясен — используй контекст или уточни.
+В «Мягко» не ругайся ни на одном языке. В «Без фильтров» и «Умном» сохраняй
+установленную манеру и уместную разнообразную ненормативную лексику на выбранном языке;
+русские примеры ругательств не надо вставлять в иноязычный ответ. Сначала точный,
+понятный ответ по существу, затем стиль. Правила безопасности действуют на всех языках."""
+SYSTEM += "\n" + LANGUAGE_RULE
+SMART_SYSTEM += "\n" + LANGUAGE_RULE
+
 
 _CHEAT_TERMS = re.compile(
     r"\b(?:чит(?:а|у|ом|е|ы|ов|ам|ами|ах)?|читерск\w*|аимбот\w*|эймбот\w*|"
@@ -328,6 +343,16 @@ def db_init():
     with closing(sqlite3.connect(DB, timeout=10)) as con, con:
         con.execute("PRAGMA journal_mode=WAL")
         con.executescript("""
+        CREATE TABLE IF NOT EXISTS move_campaigns (
+            campaign_key TEXT PRIMARY KEY, sender_bot_id INTEGER NOT NULL,
+            created_at REAL NOT NULL, target_username TEXT NOT NULL, status TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS move_deliveries (
+            campaign_key TEXT NOT NULL, user_id INTEGER NOT NULL, pass_no INTEGER NOT NULL,
+            scheduled_at REAL NOT NULL, next_attempt REAL NOT NULL,
+            state TEXT NOT NULL DEFAULT 'pending', claim_token TEXT,
+            lease_until REAL NOT NULL DEFAULT 0, attempts INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY(campaign_key,user_id,pass_no));
+        CREATE INDEX IF NOT EXISTS move_due ON move_deliveries(state,next_attempt);
         CREATE TABLE IF NOT EXISTS bot_members (user_id INTEGER PRIMARY KEY, username TEXT);
         CREATE TABLE IF NOT EXISTS friend_roles (
             user_id INTEGER PRIMARY KEY, granted_by INTEGER NOT NULL, granted_at REAL NOT NULL
@@ -439,6 +464,7 @@ def db_run(action, uid=0, value=None):
         elif action == "reset":
             con.execute("DELETE FROM messages WHERE user_id=?", (uid,))
         elif action == "delete":
+            con.execute("DELETE FROM move_deliveries WHERE user_id=?", (uid,))
             con.execute("DELETE FROM friend_roles WHERE user_id=?", (uid,))
             con.execute("DELETE FROM name_notice_v28 WHERE user_id=?", (uid,))
             con.execute("DELETE FROM messages WHERE user_id=?", (uid,))
@@ -488,6 +514,7 @@ pay_router.pre_checkout_query.filter(BotRoleFilter(payment=True))
 pay_router.callback_query.filter(F.message.chat.type == ChatType.PRIVATE, BotRoleFilter(payment=True))
 support_service = Support(lambda: DB, lambda: OWNER_ID, on_home=lambda message, uid: return_home(message, uid))
 client = None
+VOICE_CLIENT = None
 in_flight = 0
 ERROR_MESSAGE = "Сервера сдохли"
 PRO_PHOTO = BASE_DIR / "pro.jpg"
@@ -538,7 +565,7 @@ pay_router.callback_query.outer_middleware(SupportMiddleware(support_service))
 
 CHANNEL_USERNAME = "@Gosha_Ai_Channel"
 CHANNEL_URL = "https://t.me/Gosha_Ai_Channel"
-CHANNEL_GATE_TITLE = "📣 Подпишись на канал Гоши"
+CHANNEL_GATE_TITLE = "👋 Привет! Я Гоша AI"
 _CHANNEL_ADMIN_UNTIL = {}
 _CHANNEL_RETRY_UNTIL = {}
 _CHANNEL_SCREENS = {}
@@ -551,7 +578,7 @@ CHANNEL_CHECK_TIMEOUT = 5
 
 def subscription_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📲 Подписаться на канал", url=CHANNEL_URL)],
+        [InlineKeyboardButton(text="📣 Гошин ТГК", url=CHANNEL_URL)],
         [button("✅ Проверить подписку", "channel:check")],
     ])
 
@@ -649,9 +676,10 @@ router.my_chat_member.register(channel_membership_updated)
 
 def channel_gate_text(state=False, checked=False):
     body = (CHANNEL_GATE_TITLE + "\n\n"
-            "🔒 Чтобы пользоваться ботом, нужна подписка на наш ТГК.\n\n"
-            "Там — новости, обновления и анонсы 🫶\n"
-            "Подпишись и нажми «Проверить подписку» — открою доступ ✨")
+            "Со мной можно поболтать, разобрать задачу или просто выговориться 💬\n\n"
+            "🫶 Чтобы не потерять Гошу, подпишись на Гошин ТГК — там новости и обновления.\n\n"
+            "Чтобы пользоваться ботом, нужна подписка. Нажми «📣 Гошин ТГК», "
+            "а потом «✅ Проверить подписку» — и начнём ✨")
     if state is None:
         body += "\n\n⚠️ Проверка сейчас недоступна. Попробуй чуть позже. Помощь: /support."
     elif checked:
@@ -693,7 +721,7 @@ class ChannelSubscriptionMiddleware(BaseMiddleware):
     # Service, data controls, human support and financial records stay accessible.
     safe_commands = frozenset({"support", "paysupport", "tickets", "privacy", "terms", "help",
                                "myid", "role", "reset", "delete", "paymentstatus", "reply",
-                               "stars", "payments", "refund", "friend", "unfriend", "friends", "plus", "pro", "channelstatus"})
+                               "stars", "payments", "refund", "friend", "unfriend", "friends", "plus", "pro", "channelstatus", "announce_move", "move_status", "cancel_move"})
     safe_callbacks = frozenset({"channel:check", "payment:agree", "ui:pro", "pro:buy", "ui:support", "ui:privacy", "ui:privacy_details",
                                 "ui:terms", "ui:help", "ui:help_details", "ui:paymentstatus"})
 
@@ -915,13 +943,14 @@ WELCOME = (
     "💀 Без фильтров — самая резкая словесная перепалка.\n"
     "🧠 Умный — задачи, фото и объяснения · Плюс, 5 запросов/час.\n\n"
     "<b>16+</b> · Это ИИ-персонаж. Продолжая, соглашаешься на выбранный "
-    "стиль и обработку сообщений: текст передаётся внешнему ИИ-сервису и провайдеру модели.\n"
+    "стиль и обработку сообщений: текст/фото передаются внешнему ИИ-сервису, голосовые — сервису распознавания речи. Подробнее: /privacy.\n"
     "Не хочешь ругани — сразу выбирай «Мягко»."
 )
 PRIVACY_DETAILS = (
     "<b>🔒 О данных</b>\n\n"
     "Текущий текст, присланное для разбора фото и до 24 прошлых сообщений передаются внешнему ИИ-сервису и провайдеру модели. "
-    "Фото не сохраняются в локальной базе бота; сохраняются текст запроса и ответ. "
+    "Голосовое передаётся внешнему сервису распознавания речи, затем расшифровка — ИИ. "
+    "Фото и записи голоса не сохраняются в базе бота; сохраняются текст/расшифровка и ответ. "
     "Не отправляй пароли и чужие личные данные.\n\n"
     "/reset — стереть переписку. /delete — также настройки и согласие. "
     "Активный оплаченный доступ, записи платежей, временные антиспам-счётчики сохраняются. "
@@ -949,7 +978,7 @@ TERMS = (
 )
 HELP_DETAILS = (
     "<b>❔ Как общаться</b>\n\n"
-    "Просто пиши. Гоша отвечает на твою реплику, не рассказывает анекдоты.\n"
+    "Пиши на удобном языке. Можно прислать голосовое до 5 минут и 20 МБ — ответ будет текстом, если распознавание подключено. Один ответ — один запрос выбранного режима.\n"
     "😌 Мягко — спокойно и без мата.\n"
     "💀 Без фильтров — самая грубая добровольная перепалка. "
     "При реальном кризисе — поддержка, не добивание.\n"
@@ -973,13 +1002,13 @@ HELP_DETAILS = (
 PRIVACY = (
     "<b>🔒 О данных — коротко</b>\n\n"
     "• Текст, фото задачи и до 24 прошлых сообщений передаются внешнему ИИ-сервису и провайдеру модели.\n"
-    "• Фото не хранятся в базе бота; текст и ответы сохраняются. Не присылай секреты.\n"
+    "• Голосовые передаются сервису распознавания, расшифровка — ИИ. Записи голоса и фото не хранятся в базе; текст и ответы сохраняются. Не присылай секреты.\n"
     "• /reset — забыть диалог; /delete — удалить также настройки и согласие. Платежи, оплаченный доступ и временные счётчики сохраняются.\n"
     "• Поддержку читает владелец, не ИИ. /delete удаляет номера обращений в базе, но не копии в Telegram и у провайдеров."
 )
 HELP = (
     "<b>❔ Как общаться</b>\n\n"
-    "Просто напиши Гоше — команды не нужны.\n\n"
+    "Пиши на удобном языке или отправь голосовое — отвечу текстом 🎙\n\n"
     "😌 <b>Мягко</b> — спокойно, без мата.\n"
     "💀 <b>Без фильтров</b> — добровольная резкая перепалка.\n"
     "✦ <b>Умный</b> — задачи, фото и объяснения; Плюс, 5 запросов/час.\n\n"
@@ -1562,7 +1591,179 @@ def configured_model_identity(mode):
     return public_model_text(f"В этом режиме настроена модель {model}.")
 
 
-async def generate(message, uid, text, photo=None, image_requested=False):
+# Incoming voice is optional. No recording is written to disk or the database.
+class LimitedVoiceBuffer(BytesIO):
+    def write(self, data):
+        if self.tell() + len(data) > MAX_VOICE_BYTES:
+            raise ValueError("Voice too large")
+        return super().write(data)
+
+
+async def transcribe_voice(message, voice):
+    with LimitedVoiceBuffer() as buffer:
+        await asyncio.wait_for(message.bot.download(voice.file_id, destination=buffer, timeout=20), timeout=25)
+        audio = buffer.getvalue()
+    if not audio or not audio.startswith(b"OggS"):
+        raise ValueError("Unsupported voice recording")
+    # Transcriptions preserve the spoken language; do not use translations here.
+    result = await asyncio.wait_for(VOICE_CLIENT.audio.transcriptions.create(
+        model=VOICE_MODEL, file=("voice.ogg", audio, "audio/ogg"),
+        response_format="text", timeout=45), timeout=50)
+    return ((result if isinstance(result, str) else getattr(result, "text", "")) or "").strip()
+
+
+MOVE_TARGET = "GoshaAIrobot"
+MOVE_KEY = "move_to_GoshaAIrobot_v1"
+MOVE_OFFSETS = (60, 600, 1200)  # From the owner's /announce_move, NOT from deploy.
+
+
+def move_db(action, sender_id, value=None):
+    """Persistent campaign, bounded claims. No transaction spans a network call."""
+    now = time.time()
+    with closing(sqlite3.connect(DB, timeout=10)) as con, con:
+        con.execute("BEGIN IMMEDIATE")
+        campaign = con.execute("SELECT sender_bot_id,status,created_at FROM move_campaigns WHERE campaign_key=?", (MOVE_KEY,)).fetchone()
+        if action == "start":
+            if campaign:
+                return "exists" if campaign[0] == sender_id else "other_sender"
+            con.execute("INSERT INTO move_campaigns VALUES(?,?,?,?,?)", (MOVE_KEY, sender_id, now, MOVE_TARGET, "active"))
+            for n, delay in enumerate(MOVE_OFFSETS, 1):
+                con.execute("INSERT INTO move_deliveries(campaign_key,user_id,pass_no,scheduled_at,next_attempt) SELECT ?,user_id,?,?,? FROM bot_members WHERE user_id>0", (MOVE_KEY, n, now+delay, now+delay))
+            return "started"
+        if not campaign or campaign[0] != sender_id:
+            return None
+        if action == "status":
+            stats = con.execute("SELECT pass_no,state,COUNT(*) FROM move_deliveries WHERE campaign_key=? GROUP BY pass_no,state ORDER BY pass_no,state", (MOVE_KEY,)).fetchall()
+            return {"status": campaign[1], "created_at": campaign[2], "stats": stats}
+        if action == "cancel":
+            con.execute("UPDATE move_campaigns SET status='cancelled' WHERE campaign_key=?", (MOVE_KEY,))
+            con.execute("UPDATE move_deliveries SET state='cancelled',claim_token=NULL,lease_until=0 WHERE campaign_key=? AND state='pending'", (MOVE_KEY,))
+            return "cancelled"
+        if campaign[1] != "active":
+            return None
+        if action == "claim":
+            row = con.execute("SELECT user_id,pass_no,attempts FROM move_deliveries WHERE campaign_key=? AND state='pending' AND next_attempt<=? AND lease_until<=? ORDER BY scheduled_at,user_id LIMIT 1", (MOVE_KEY, now, now)).fetchone()
+            if not row:
+                pending = con.execute("SELECT 1 FROM move_deliveries WHERE campaign_key=? AND state='pending' LIMIT 1", (MOVE_KEY,)).fetchone()
+                if not pending:
+                    con.execute("UPDATE move_campaigns SET status='completed' WHERE campaign_key=?", (MOVE_KEY,))
+                return None
+            uid, n, attempts = row
+            token = secrets.token_hex(16)
+            con.execute("UPDATE move_deliveries SET claim_token=?,lease_until=? WHERE campaign_key=? AND user_id=? AND pass_no=?", (token, now+120, MOVE_KEY, uid, n))
+            return {"user_id": uid, "pass_no": n, "attempts": attempts, "token": token}
+        if action == "finish":
+            claim, state, delay, increment = value
+            uid, n = claim['user_id'], claim['pass_no']
+            if state not in {"sent", "blocked", "pending", "failed"}:
+                raise ValueError("Bad delivery state")
+            found = con.execute("SELECT 1 FROM move_deliveries WHERE campaign_key=? AND user_id=? AND pass_no=? AND claim_token=? AND state='pending'", (MOVE_KEY, uid, n, claim['token'])).fetchone()
+            if not found:
+                return False
+            con.execute("UPDATE move_deliveries SET state=?,next_attempt=?,attempts=attempts+?,claim_token=NULL,lease_until=0 WHERE campaign_key=? AND user_id=? AND pass_no=?", (state, now+max(0,delay), increment, MOVE_KEY, uid, n))
+            if state == "blocked":
+                con.execute("UPDATE move_deliveries SET state='blocked',claim_token=NULL,lease_until=0 WHERE campaign_key=? AND user_id=? AND state='pending'", (MOVE_KEY,uid))
+            return True
+        raise ValueError("Unknown migration action")
+
+
+async def move_store(action, sender_id, value=None):
+    return await asyncio.to_thread(move_db, action, sender_id, value)
+
+
+def move_text(pass_no):
+    intros = {1: "📣 Гоша меняет адрес!", 2: "🫶 Напоминание от Гоши", 3: "✨ Последнее напоминание о новом адресе"}
+    return (intros[pass_no] + "\n\n"
+            "Мой новый юзернейм — @GoshaAIrobot 🤖\n"
+            "Открой нового бота и нажми «Старт», чтобы не потеряться.\n\n"
+            "Новости и статус работ — в Гошином ТГК 📣\n"
+            "Это уведомление о переезде, не сообщение об оплате. Повторно платить по нему не нужно.")
+
+
+def move_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🤖 Открыть Гошу AI", url="https://t.me/"+MOVE_TARGET)],
+        [InlineKeyboardButton(text="📣 Гошин ТГК", url=CHANNEL_URL)],
+    ])
+
+
+async def send_move_notice(merchant):
+    claim = await move_store("claim", merchant.id)
+    if not claim:
+        return False
+    state, delay, increment = "sent", 0, 0
+    pause = 0
+    try:
+        await merchant.send_message(claim['user_id'], move_text(claim['pass_no']),
+                                    reply_markup=move_keyboard(), parse_mode=None, request_timeout=15)
+    except TelegramRetryAfter as exc:
+        state, delay = "pending", max(1, exc.retry_after)+1
+        pause = delay  # global cooldown; avoid hammering other recipients after a flood wait
+    except TelegramForbiddenError:
+        state = "blocked"
+    except TelegramBadRequest as exc:
+        reason = str(exc).lower()
+        state = "blocked" if any(x in reason for x in ("chat not found", "user is deactivated", "bot was blocked")) else "failed"
+    except (TelegramAPIError, OSError, asyncio.TimeoutError) as exc:
+        increment = 1
+        state = "failed" if claim['attempts'] >= 2 else "pending"
+        delay = 30 * (claim['attempts']+1)
+        logging.warning("Migration send failed: type=%s", type(exc).__name__)
+    await move_store("finish", merchant.id, (claim,state,delay,increment))
+    if pause:
+        await asyncio.sleep(pause)
+    return True
+
+
+async def move_notice_worker(merchant):
+    while True:
+        try:
+            worked = await send_move_notice(merchant)
+            await asyncio.sleep(0.25 if worked else 2)
+        except (sqlite3.Error, TelegramAPIError, OSError, asyncio.TimeoutError) as exc:
+            logging.warning("Migration queue failed: type=%s", type(exc).__name__)
+            await asyncio.sleep(5)
+
+
+@router.message(Command("announce_move", "move_status", "cancel_move"))
+async def move_handler(message: Message):
+    if not owner_admin_allowed(message, message.from_user.id):
+        await message.answer("⛔ Только для владельца.")
+        return
+    merchant = MAIN_BOT or message.bot
+    command = message.text.split()[0].split('@',1)[0].lower()
+    if command == "/announce_move":
+        try:
+            me = await merchant.get_me(request_timeout=5)
+        except (TelegramAPIError, OSError, asyncio.TimeoutError):
+            await message.answer("Не получилось проверить бота. Попробуй позже.")
+            return
+        if (me.username or "").casefold() == MOVE_TARGET.casefold():
+            await message.answer("Рассылку нужно запускать в старом боте, с его токеном. Сейчас это уже @GoshaAIrobot.")
+            return
+        result = await move_store("start", merchant.id)
+        if result == "started":
+            await message.answer("✅ Запустил три уведомления о переходе на @GoshaAIrobot: через 1, 10 и 20 минут от этой команды.\n\nДо завершения оставь старый токен и включённый бот. Статус: /move_status · Отмена: /cancel_move")
+        else:
+            await message.answer("Рассылка уже создана и повторно не запускается. Проверь /move_status. Если сменён токен, статус доступен только в старом боте.")
+    elif command == "/cancel_move":
+        result = await move_store("cancel", merchant.id)
+        await message.answer("⏹ Рассылка остановлена. Уже отправленные сообщения останутся; отправляемое сейчас ещё может дойти." if result else "У этого бота нет рассылки.")
+    else:
+        result = await move_store("status", merchant.id)
+        if not result:
+            await message.answer("У этого бота нет рассылки. Запуск: /announce_move")
+            return
+        labels = {"active":"идёт", "completed":"завершена", "cancelled":"остановлена"}
+        states = {"sent":"доставлено", "pending":"в очереди", "blocked":"недоступны", "failed":"ошибки", "cancelled":"отменено"}
+        lines = ["📬 Рассылка: " + labels.get(result['status'],result['status'])]
+        for n, offset in enumerate(MOVE_OFFSETS,1):
+            counts = ", ".join(f"{states[state]}: {count}" for p,state,count in result['stats'] if p == n) or "нет получателей"
+            lines.append(f"{n}. Через {offset//60} мин — {counts}")
+        await message.answer("\n".join(lines))
+
+
+async def generate(message, uid, text, photo=None, image_requested=False, voice=None):
     global in_flight
     row = await consent(message, uid)
     if not row:
@@ -1587,6 +1788,14 @@ async def generate(message, uid, text, photo=None, image_requested=False):
     if photo is not None and (getattr(photo, "file_size", 0) or 0) > MAX_PHOTO_BYTES:
         await message.answer("📸 Фото слишком большое. Пришли снимок до 10 МБ. Запрос не списан.")
         return
+    if voice is not None:
+        if VOICE_CLIENT is None:
+            await message.answer("🎙 Голосовые пока недоступны.")
+            return
+        if ((getattr(voice, "file_size", 0) or 0) > MAX_VOICE_BYTES
+                or (getattr(voice, "duration", 0) or 0) > MAX_VOICE_SECONDS):
+            await message.answer("🎙 Пришли голосовое до 5 минут и 20 МБ.")
+            return
     input_limit = SMART_INPUT_CHARS if is_smart else INPUT_CHARS
     if len(text) > input_limit:
         await message.answer(f"Сократи до {input_limit} символов.")
@@ -1617,6 +1826,29 @@ async def generate(message, uid, text, photo=None, image_requested=False):
                 await message.answer(f"Пауза между запросами — {permit.get('cooldown', COOLDOWN)} с.")
             return
         reservation = permit['reservation']
+        if voice is not None:
+            try:
+                text = await transcribe_voice(message, voice)
+            except (APIError, TelegramAPIError, OSError, ValueError, asyncio.TimeoutError) as exc:
+                logging.warning("Voice processing failed: type=%s status=%s", type(exc).__name__, getattr(exc, "status_code", None))
+                await message.answer("🎙 Не получилось разобрать голосовое. Попробуй ещё раз или напиши текстом.")
+                return
+            if not text:
+                await message.answer("🎙 Не расслышал. Запиши ещё раз или напиши текстом.")
+                return
+            if len(text) > input_limit:
+                await message.answer("🎙 Слишком длинное сообщение. Пришли голосовое покороче.")
+                return
+            if is_cheat_code_request(text):
+                await message.answer(CHEAT_CODE_REPLY, parse_mode=None)
+                return
+            if is_identity_question(text):
+                reply = configured_model_identity(mode) if private_owner_identity(message, uid) else IDENTITY_REPLY
+                await message.answer(reply, parse_mode=None)
+                return
+            if disabled_image_request(text):
+                await image_prompt(message, uid)
+                return
         photo_data_url = None
         if photo is not None:
             try:
@@ -1711,9 +1943,14 @@ async def photo_task(message: Message):
     await generate(message, message.from_user.id, text, photo=message.photo[-1])
 
 
+@router.message(F.voice)
+async def voice_message(message: Message):
+    await generate(message, message.from_user.id, "", voice=message.voice)
+
+
 @router.message()
 async def unsupported(message: Message):
-    await message.answer("Поддерживаю текст и фотографии задач в «🧠 Умном». Фото пришли как фотографию, не как файл. Голосовые и документы пока не разбираю.")
+    await message.answer("Пришли текст или голосовое 🎙 — отвечу текстом. Фото задач разбираю в «Умном». Документы пока не читаю.")
 
 
 OWNER_PAGE_SIZE = 10
@@ -2294,7 +2531,7 @@ def backup_before_price_restore():
 
 
 async def main():
-    global client, MAIN_BOT, PAYMENT_BOT, MAIN_USERNAME, PAYMENT_USERNAME
+    global client, VOICE_CLIENT, MAIN_BOT, PAYMENT_BOT, MAIN_USERNAME, PAYMENT_USERNAME
     if not TELEGRAM_BOT_TOKEN or not OPENROUTER_API_KEY:
         raise SystemExit("Задай TELEGRAM_BOT_TOKEN и OPENROUTER_API_KEY в Railway Variables")
     try:
@@ -2307,6 +2544,8 @@ async def main():
     await store("cleanup")
     await bill("cleanup")
     client = AsyncOpenAI(api_key=OPENROUTER_API_KEY, base_url="https://openrouter.ai/api/v1", timeout=45, max_retries=0)
+    if GROQ_API_KEY:
+        VOICE_CLIENT = AsyncOpenAI(api_key=GROQ_API_KEY, base_url="https://api.groq.com/openai/v1", timeout=45, max_retries=0)
     MAIN_BOT = Bot(token=TELEGRAM_BOT_TOKEN)
     bots = [MAIN_BOT]
     dp = Dispatcher(disable_fsm=True)
@@ -2324,6 +2563,7 @@ async def main():
             await apply_brand(merchant, payment=PAYMENT_BOT is not None and merchant.id == PAYMENT_BOT.id)
         tasks.append(asyncio.create_task(bonus_retirement_worker(MAIN_BOT)))
         tasks.append(asyncio.create_task(name_notice_worker(MAIN_BOT)))
+        tasks.append(asyncio.create_task(move_notice_worker(MAIN_BOT)))
         await MAIN_BOT.set_my_commands([
             BotCommand(command="menu", description="🎛 Главное меню"),
             BotCommand(command="plus", description=f"💠 Плюс · 7 дней за {billing.PRICE} ⭐"),
@@ -2344,7 +2584,7 @@ async def main():
                 BotCommand(command="terms", description="📜 Условия"),
                 BotCommand(command="paysupport", description="🛟 Помощь с покупкой"),
             ])
-        logging.warning("Gosha v33 fast channel checks; bots=%s payments=%s owner_has_no_quota=True", len(bots), payments_ready())
+        logging.warning("Gosha v34 migration, multilingual and voice; bots=%s payments=%s owner_has_no_quota=True", len(bots), payments_ready())
         if not payments_ready():
             logging.warning("Payment setup checks failed: %s", ", ".join(name for name, ok, _ in payment_checks() if not ok))
         await dp.start_polling(*bots, allowed_updates=["message", "callback_query", "pre_checkout_query", "chat_member", "my_chat_member"])
@@ -2353,6 +2593,8 @@ async def main():
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
         await client.close()
+        if VOICE_CLIENT is not None:
+            await VOICE_CLIENT.close()
         for merchant in bots:
             await merchant.session.close()
 
