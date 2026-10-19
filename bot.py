@@ -45,6 +45,8 @@ load_dotenv()
 # OPENROUTER_API_KEY=твой_ключ_OpenRouter
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
+# Separate Pollinations secret: never reuse the chat API key for image generation.
+IMAGE_API_KEY = os.getenv("IMAGE_API_KEY", "").strip()
 # Отдельный бот от BotFather; ключ хранить только в Railway Variables.
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
 VOICE_MODEL = "whisper-large-v3-turbo"
@@ -2175,18 +2177,68 @@ def safe_image_bytes(blob):
         return data
 
 
-async def fetch_generated_image(prompt):
-    # Explicit model, n=1, no automatic paid fallback and no arbitrary image-URL fetch.
+def image_error_detail(raw,prompt=''):
+    """Only the API error message; never dump headers or arbitrary response data."""
     import json
-    payload={'model':IMAGE_MODEL,'prompt':prompt,'n':1}
+    try:
+        data=json.loads(raw)
+    except (ValueError,TypeError):
+        return ''
+    error=data.get('error') if isinstance(data,dict) else None
+    text=error.get('message') if isinstance(error,dict) else error
+    if not isinstance(text,str):
+        return ''
+    for secret in (IMAGE_API_KEY,OPENROUTER_API_KEY,TELEGRAM_BOT_TOKEN,PAYMENT_BOT_TOKEN,GROQ_API_KEY,prompt):
+        if secret:
+            text=text.replace(secret,'[скрыто]')
+    text=re.sub(r'(?i)bearer\s+\S+','Bearer [скрыто]',text)
+    text=re.sub(r'(?i)(?:sk-|(?:sk|pk)_)[a-z0-9_-]+','[ключ скрыт]',text)
+    text=re.sub(r'\b\d{6,}:[A-Za-z0-9_-]{20,}\b','[токен скрыт]',text)
+    text=re.sub(r'https?://\S+','[ссылка скрыта]',text)
+    text=re.sub(r'(?i)openrouter','API-сервис',text)
+    return ' '.join(text.split())[:450]
+
+
+def image_error_reason(text):
+    t=text.lower()
+    if any(v in t for v in ('insufficient','not enough','credits','credit balance','balance too low')):
+        return 'credit'
+    if any(v in t for v in ('spending limit','budget','key limit','quota')):
+        return 'limit'
+    if any(v in t for v in ('verif','organization')):
+        return 'verification'
+    if any(v in t for v in ('not available','not found','no endpoints','no provider')):
+        return 'availability'
+    return 'unspecified'
+
+
+async def fetch_generated_image(prompt):
+    # Pollinations only. A separate key, no automatic retries or fallback billing.
+    import json
+    if not IMAGE_API_KEY:
+        raise ValueError('IMAGE_API_KEY missing')
+    payload={'model':IMAGE_MODEL,'prompt':prompt,'n':1,'size':'1024x1024',
+             'response_format':'b64_json','safe':'privacy,secrets,sexual,violence'}
     # Quality is an OpenAI Images parameter, not a universal model parameter.
     if IMAGE_MODEL.startswith('openai/gpt-image-'):
-        payload['quality']=IMAGE_QUALITY
+        payload['quality']='medium' if IMAGE_QUALITY=='auto' else IMAGE_QUALITY
     async with httpx.AsyncClient(timeout=httpx.Timeout(180,connect=10),follow_redirects=False) as http:
-        async with http.stream('POST','https://openrouter.ai/api/v1/images',
-            headers={'Authorization':'Bearer '+OPENROUTER_API_KEY},json=payload) as response:
-            response.raise_for_status()
+        async with http.stream('POST','https://gen.pollinations.ai/v1/images/generations',
+            headers={'Authorization':'Bearer '+IMAGE_API_KEY,'Accept':'application/json'},json=payload) as response:
             raw=bytearray()
+            if response.is_error:
+                # Read a bounded error body before raise_for_status closes the stream.
+                async for chunk in response.aiter_bytes():
+                    raw.extend(chunk[:max(0,65536-len(raw))])
+                    if len(raw)>=65536:
+                        break
+                try:
+                    response.raise_for_status()
+                except httpx.HTTPStatusError as exc:
+                    exc.image_api_detail=image_error_detail(raw,prompt)
+                    exc.image_api_reason=image_error_reason(exc.image_api_detail)
+                    raise
+            response.raise_for_status()
             async for chunk in response.aiter_bytes():
                 raw.extend(chunk)
                 if len(raw)>IMAGE_MAX_RESPONSE:
@@ -2217,6 +2269,10 @@ async def generate_image(message,uid,prompt,voice_handoff=False):
         return
     if is_cheat_code_request(prompt):
         await message.answer(CHEAT_CODE_REPLY,parse_mode=None)
+        return
+    if not IMAGE_API_KEY:
+        await message.answer('🎨 Добавь ключ Pollinations в Railway → Variables → IMAGE_API_KEY и перезапусти бот.'
+                             if uid==OWNER_ID else '🎨 Генерация пока недоступна.')
         return
     if client is None or not IMAGE_MODEL or not IMAGE_SAFETY_MODEL:
         await message.answer('🎨 Генерация пока недоступна.')
@@ -2270,10 +2326,17 @@ async def generate_image(message,uid,prompt,voice_handoff=False):
         logging.warning('Image generation failed: stage=%s model=%s type=%s status=%s',stage,
             IMAGE_SAFETY_MODEL if stage=='safety' else IMAGE_MODEL,type(exc).__name__,status)
         if uid==OWNER_ID:
-            hint={401:'Проверь API-ключ.',402:'Проверь доступный кредит и лимит API-ключа.',
+            hint={401:'Проверь API-ключ.',402:'Проверь баланс Pollen и бюджет ключа Pollinations.' if stage=='generation' else 'Проверь кредит API проверки запроса.',
                   403:'У ключа нет доступа или запрос отклонён сервисом.',404:'Модель или маршрут API недоступны.',
                   429:'Лимит запросов API — попробуй позже.'}.get(status,'Посмотри строку Image generation failed в логах.')
-            await message.answer(f'🎨 Пока недоступно. Этап: {stage} · код: {status or type(exc).__name__}.\n{hint}')
+            detail=getattr(exc,'image_api_detail','')
+            reason=getattr(exc,'image_api_reason','unspecified')
+            # Body is shown only to configured Owner, not copied into shared logs.
+            logging.warning('Image API diagnostic: stage=%s status=%s reason=%s has_detail=%s',stage,status,reason,bool(detail))
+            if detail:
+                await message.answer(f'🎨 API отказал · код {status}.\nОтвет API: {detail}',parse_mode=None)
+            else:
+                await message.answer(f'🎨 Пока недоступно. Этап: {stage} · код: {status or type(exc).__name__}.\n{hint}')
         else:
             await message.answer('🎨 Генерация пока недоступна.')
     finally:
@@ -3336,7 +3399,7 @@ async def main():
                 BotCommand(command="terms", description="📜 Условия"),
                 BotCommand(command="paysupport", description="🛟 Помощь с покупкой"),
             ])
-        logging.warning("Gosha v42 premium image generator; invitation rewards cap 8m; shared tokens, referrals, shop and maintenance; bots=%s payments=%s owner_has_no_quota=True", len(bots), payments_ready())
+        logging.warning("Gosha v44 Pollinations image API; invitation rewards cap 8m; shared tokens, referrals, shop and maintenance; bots=%s payments=%s owner_has_no_quota=True", len(bots), payments_ready())
         if not payments_ready():
             logging.warning("Payment setup checks failed: %s", ", ".join(name for name, ok, _ in payment_checks() if not ok))
         await dp.start_polling(*bots, allowed_updates=["message", "callback_query", "pre_checkout_query", "chat_member", "my_chat_member"])
