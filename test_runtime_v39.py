@@ -214,7 +214,7 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result.startswith(b'\xff\xd8'))
         self.assertEqual(len(calls),1);self.assertEqual(calls[0].method,'POST')
         self.assertEqual(str(calls[0].url),'https://openrouter.ai/api/v1/images')
-        self.assertEqual(json.loads(calls[0].content),{'model':app.IMAGE_MODEL,'prompt':'Кот','n':1})
+        self.assertEqual(json.loads(calls[0].content),{'model':app.IMAGE_MODEL,'prompt':'Кот','n':1,'quality':app.IMAGE_QUALITY})
     async def test_image_http_unauthorized_does_not_fallback(self):
         import httpx
         calls=[]

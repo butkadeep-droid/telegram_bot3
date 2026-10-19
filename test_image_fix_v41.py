@@ -33,7 +33,8 @@ class ImageFixTests(unittest.IsolatedAsyncioTestCase):
             await app.generate_image(self.m,7,'лимон')
         fetch.assert_awaited_once_with('лимон');self.m.answer_photo.assert_awaited_once()
         self.assertEqual(self.create.call_args.kwargs['max_tokens'],256)
-        self.assertEqual(self.create.call_args.kwargs['extra_body'],{'reasoning':{'enabled':False}})
+        self.assertNotIn('extra_body',self.create.call_args.kwargs)
+        self.assertEqual(self.create.call_args.kwargs['model'],app.IMAGE_SAFETY_MODEL)
         self.assertEqual((await app.bill('status',7))['image_free'],9)
     async def test_car_delivered(self):
         app.db_run('friend_grant',999,7);self.create.return_value=reply('allow')
