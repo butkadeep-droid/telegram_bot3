@@ -21,6 +21,7 @@ from contextlib import closing, suppress
 from datetime import datetime, timezone
 from pathlib import Path
 
+from tasks import Tasks, TasksMiddleware
 from aiogram import Bot, Dispatcher, F, Router, BaseMiddleware
 from aiogram.enums import ChatAction, ChatType
 from aiogram.exceptions import TelegramBadRequest, TelegramAPIError, TelegramNetworkError, TelegramUnauthorizedError, TelegramForbiddenError, TelegramRetryAfter
@@ -406,6 +407,7 @@ def db_init():
             con.execute("INSERT OR IGNORE INTO name_notice_v28(user_id) SELECT user_id FROM bot_members WHERE user_id > 0")
             con.execute("INSERT INTO bot_registry_state VALUES('name_notice_v28_seeded','done')")
     support_service.init()
+    tasks_service.init()
 
 
 def db_run(action, uid=0, value=None):
@@ -571,6 +573,7 @@ pay_router.message.filter(F.chat.type == ChatType.PRIVATE, BotRoleFilter(payment
 pay_router.pre_checkout_query.filter(BotRoleFilter(payment=True))
 pay_router.callback_query.filter(F.message.chat.type == ChatType.PRIVATE, BotRoleFilter(payment=True))
 support_service = Support(lambda: DB, lambda: OWNER_ID, on_home=lambda message, uid: return_home(message, uid))
+tasks_service = Tasks(lambda: DB, lambda: OWNER_ID, lambda *args: eco(*args), lambda m,u: consent(m,u),lambda m,u: remove_navigation_screen(m,u))
 client = None
 VOICE_CLIENT = None
 in_flight = 0
@@ -587,17 +590,14 @@ BOTTOM_ACTIONS = {
     "🪙 Баланс": "/balance",
     "🤝 Друзья": "/ref",
 }
-BOTTOM_KEYBOARD_VERSION = 2
+BOTTOM_KEYBOARD_VERSION = 3
 
 
 def bottom_keyboard():
     return ReplyKeyboardMarkup(keyboard=[
-        [KeyboardButton(text="🎛 Главное меню")],
-        [KeyboardButton(text="🪙 Баланс"), KeyboardButton(text="🤝 Друзья")],
-        [KeyboardButton(text="🧹 Сбросить историю"), KeyboardButton(text="✨ Мой Plus")],
-        [KeyboardButton(text="❔ Как общаться"), KeyboardButton(text="🛟 Поддержка")],
+        [KeyboardButton(text="🎛 Главное меню"), KeyboardButton(text="🧹 Сбросить историю")],
     ], resize_keyboard=True, is_persistent=True, one_time_keyboard=False,
-       input_field_placeholder="Напиши Гоше или выбери раздел…")
+       input_field_placeholder="Напиши Гоше…")
 
 
 class BottomNavigationMiddleware(BaseMiddleware):
@@ -788,9 +788,12 @@ class ImageInputNavigationMiddleware(BaseMiddleware):
             if not clear and reply:
                 clear=bool(await support_service.call('lookup',bid=bid,uid=uid,mid=reply.message_id))
             if clear:
+                await tasks_service.call('clear',bid,uid)
                 old=await image_input('clear',bid,uid)
                 await remove_image_input_prompt(message.bot,uid,old)
-        elif (event.data or '').startswith(('ui:','mode:','pro:','sup:','admin:','shop:','credit:','maintenance:')):
+        elif (event.data or '').startswith(('ui:','mode:','pro:','sup:','admin:','shop:','credit:','maintenance:','task:')):
+            if not (event.data or '').startswith('task:'):
+                await tasks_service.call('clear',bid,uid)
             old=await image_input('clear',bid,uid)
             # The clicked UI screen is handled by the normal navigation code.
             if old and old['prompt_mid']!=message.message_id:
@@ -811,6 +814,8 @@ router.message.outer_middleware(SupportMiddleware(support_service))
 router.callback_query.outer_middleware(ban_gate)
 router.callback_query.outer_middleware(ImageInputNavigationMiddleware())
 router.callback_query.outer_middleware(SupportMiddleware(support_service))
+router.message.outer_middleware(TasksMiddleware(tasks_service,lambda: MAIN_BOT))
+router.callback_query.outer_middleware(TasksMiddleware(tasks_service,lambda: MAIN_BOT))
 pay_router.message.outer_middleware(maintenance_gate)
 pay_router.message.outer_middleware(user_lock)
 pay_router.callback_query.outer_middleware(maintenance_gate)
@@ -1196,21 +1201,38 @@ def smart_allowed(uid, state):
 
 
 def menu_keyboard(mode="soft", pro=False, uid=None, friend=False):
-    labels = {"soft": "🌿 Мягко", "smart": "💡 Умный", "raw": "🔥 Без фильтров"}
-    rows = [[button(("✓ " if key == mode else "") + labels[key] +
-                    (" 🔒" if key == "smart" and not smart_allowed(uid, {"pro": pro, "friend": friend}) else ""),
-                    "mode:" + key)
-             for key in ("soft", "smart", "raw")]]
-    rows.append([button("🫶 Friend · привилегии" if friend else "✨ Мой Plus · продлить" if pro else f"✨ Plus · {billing.PRICE} ⭐ на 7 дней", "ui:pro")])
-    rows.append([button("🪙 Баланс и магазин", "ui:balance"), button("🤝 Пригласить друзей", "ui:ref")])
-    rows.append([button("🎨 Создать картинку", "ui:image")])
+    rows = [
+        [button("🎛 Режимы", "ui:modes"), button("✨ Plus", "ui:pro")],
+        [button("🛍 Магазин", "ui:shop"), button("🤝 Друзья", "ui:ref")],
+        [button("🎯 Задания", "task:home"), button("⚙️ Настройки", "ui:settings")],
+    ]
     if OWNER_ID > 0 and uid == OWNER_ID:
-        rows.append([button("🛠 Меню бота", "admin:users:0")])
-    rows.append([button("❔ Как общаться", "ui:help"), button("🔒 О данных", "ui:privacy")])
-    rows.append([button("🛟 Поддержка", "ui:support")])
-    if OWNER_ID > 0 and uid == OWNER_ID:
-        rows.append([button("📥 Обращения", "sup:list:0")])
+        rows.append([button("🛠 Управление", "admin:users:0")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def show_modes(message,uid):
+    row=await store("get",uid)
+    mode=row[1] if row and row[1] in ALL_MODES else "soft"
+    labels={"soft":"🌿 Мягко", "smart":"💡 Умный", "raw":"🔥 Без фильтров"}
+    rows=[[button(("✓ " if key==mode else "")+labels[key],"mode:"+key)] for key in ("soft","smart","raw")]
+    rows += [[button("🎨 Создать картинку","ui:image")],[button("← Главное меню","ui:menu")]]
+    text="🎛 Режимы\n\n🌿 Мягко — спокойное общение.\n🔥 Без фильтров — дерзкий стиль.\n💡 Умный — вопросы, задачи и фото.\n\n🪙 Мягко и Без фильтров: 25 000 за ответ.\nУмный: 75 000 за ответ.\n\nВыбери режим и пиши прямо в чат."
+    keyboard=InlineKeyboardMarkup(inline_keyboard=rows)
+    if mode=="smart" and SMART_PHOTO.is_file():
+        await message.answer_photo(FSInputFile(SMART_PHOTO),caption=text,parse_mode=None,reply_markup=keyboard)
+    else:
+        await message.answer(text,parse_mode=None,reply_markup=keyboard)
+
+
+async def show_settings(message,uid):
+    rows=[
+        [button("📖 Как общаться","ui:help"),button("🛡 О данных","ui:privacy")],
+        [button("💬 Поддержка","ui:support"),button("📜 Условия","ui:terms")],
+        [button("🧹 Сбросить историю","ui:reset_confirm")],
+        [button("← Главное меню","ui:menu")],
+    ]
+    await message.answer("⚙️ Настройки и помощь\n\nИнструкции, данные и связь с поддержкой — здесь.",reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
 
 
 def back_keyboard():
@@ -1232,7 +1254,7 @@ PRIVACY = (
     "Фото и аудио в базе не храним; текст и ответы сохраняем. Запрос картинки также передаётся ИИ.\n\n"
     "/reset — стереть историю. /delete — удалить профиль и согласие. "
     "Баланс, покупки, ID для учёта рефералов, начислений и банов сохраняются: удалить профиль — не значит получить награду заново.\n"
-    "Поддержку читает владелец. Не присылай пароли и ключи."
+    "Поддержку и скриншоты заданий читает владелец, не ИИ. Не присылай пароли и ключи."
 )
 PRIVACY_DETAILS = PRIVACY + (
     "\n\nПередаём до 24 предыдущих сообщений. Временные изображения не добавляются в историю. "
@@ -1242,7 +1264,7 @@ PRIVACY_DETAILS = PRIVACY + (
 )
 TERMS = (
     "<b>📜 Условия и покупки</b>\n\n"
-    "🪙 Мягко / Без фильтров: 100 000 токенов за ответ. Умный: 220 000. Один баланс на все режимы. "
+    "🪙 Мягко / Без фильтров: 25 000 токенов за ответ. Умный: 75 000. Один баланс на все режимы. "
     "Это виртуальные единицы, не фактический расход ИИ.\n"
     "Каждый день в 00:00 UTC (03:00 МСК) баланс пополняется ДО 2 500 000; с Plus — ДО 5 000 000. "
     "Если баланс выше, ничего не меняется. Остаток не сгорает. "
@@ -1262,6 +1284,7 @@ TERMS = (
     "При возврате купленные единицы и связанный бонус реферера отменяются. Если они уже потрачены, "
     "образуется задолженность, которую погашают следующие пополнения. "
     "По возврату и помощи — /paysupport. Применимые права покупателя сохраняются. "
+    "🎯 Задание TikTok: 20 разных видео, 20 скриншотов, ручная проверка владельцем. Награда 5 000 000 токенов один раз за задание; не относится к потолку реферальных наград.\n"
     "Продавец — владелец бота, не Telegram. Нажимая «К оплате», принимаешь условия."
 )
 HELP = (
@@ -1269,7 +1292,7 @@ HELP = (
     "Пиши на любом языке или присылай голосовое 🎙\n"
     "🌿 Мягко — спокойно, без мата. 🔥 Без фильтров — добровольная дерзкая перепалка.\n"
     "💡 Умный — вопросы, задачи и фото до 10 МБ.\n\n"
-    "🪙 Ответ: 100 000 токенов; Умный — 220 000. Баланс общий. /balance\n"
+    "🪙 Ответ: 25 000 токенов; Умный — 75 000. Баланс общий. /balance\n"
     "🎨 «Нарисуй кота в космосе» или /image описание — картинка. /shop — пакеты.\n"
     "🤝 /ref — твоя ссылка и награды.\n"
     "/reset — забыть диалог · /menu — меню · /support — помощь."
@@ -1328,6 +1351,7 @@ async def consent(message, uid, payment=False):
 
 
 async def show_menu(message, uid, edit=False):
+    await ensure_bottom_keyboard(message,uid)
     row = await store("get", uid)
     agreed = bool(row and row[0])
     state = await bill("status", uid)
@@ -1336,12 +1360,11 @@ async def show_menu(message, uid, edit=False):
         await store("mode", uid, "soft")
         mode = "soft"
     if agreed:
-        quota = balance_line(state)
-        bonus_line = ""
+        short_balance = "∞" if state['owner'] else num(state['balance'])
         caption = (
-            "<b>ГОША · коротко и в лицо</b>\n\n"
-            f"{role_line(uid, state)}\n🎛 Твой режим: <b>{MODE_NAMES[mode]}</b>\n{quota}{bonus_line}\n\n"
-            "Пиши прямо в чат. В «Умном» можно отправить фото задачи.\n⌨️ Быстрые разделы — внизу чата. /keyboard — показать кнопки снова."
+            "<b>ГОША AI · на связи</b>\n\n"
+            f"🎛 Режим: <b>{MODE_NAMES[mode]}</b>\n🪙 Токены: <b>{short_balance}</b>\n\n"
+            "Пиши прямо в чат или выбери раздел 👇"
         )
         kb = menu_keyboard(mode, state['pro'], uid, friend=state.get("friend", False))
     else:
@@ -1886,12 +1909,18 @@ async def image_prompt(message, uid):
     if not await consent(message,uid):
         return
     await support_service.call('clear',bid=message.bot.id,uid=uid)
-    sent=await message.answer('🎨 Что нарисовать?\n\nОтправь описание следующим сообщением — например, «Сова на ёлке».\n\nЗдесь каждое сообщение создаёт картинку. Для обычного чата нажми «Главное меню».',
+    sent=await message.answer('🎨 Что нарисовать?\n\nОтправь описание следующим сообщением — например, «Сова на ёлке».\n\n💡 На английском модель лучше понимает детали. На русском тоже можно!\n\nЗдесь каждое сообщение создаёт картинку. Для обычного чата нажми «Главное меню».',
                              reply_markup=image_input_keyboard(),parse_mode=None)
     mid=getattr(sent,'message_id',0)
     old=await image_input('set',message.bot.id,uid,mid if isinstance(mid,int) else 0)
     if old and old['prompt_mid']!=mid:
         await remove_image_input_prompt(message.bot,uid,old)
+
+
+@router.message(Command("tasks"))
+async def tasks_command(message: Message):
+    if await consent(message,message.from_user.id):
+        await tasks_service.home(message,message.from_user.id)
 
 
 @router.message(Command('image','draw','img','imh',ignore_case=True))
@@ -2134,7 +2163,7 @@ def balance_line(state):
 async def show_balance(message, uid):
     state = await bill('status',uid)
     text = ("<b>🪙 Твой баланс</b>\n\n" + balance_line(state) +
-            "\n\n🌿 Мягко / 🔥 Без фильтров: 100 000 за ответ.\n💡 Умный: 220 000 за ответ.\n🎨 Картинки — отдельный счётчик, без списания токенов.")
+            "\n\n🌿 Мягко / 🔥 Без фильтров: 25 000 за ответ.\n💡 Умный: 75 000 за ответ.\n🎨 Картинки — отдельный счётчик, без списания токенов.")
     if not state['owner']:
         text += f"\n\nСледующее пополнение: {utc_date(state['next_refill'])}."
     text += "\nОбновление ДО лимита: выше — не меняется; ниже — дополняется. Токены — внутренние единицы бота."
@@ -2167,6 +2196,7 @@ async def show_referrals(message,uid):
     from urllib.parse import quote
     await message.answer(text,parse_mode='HTML',reply_markup=InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text='↗️ Пригласить друга',url='https://t.me/share/url?url='+quote(link,safe='')+'&text='+quote('Гоша AI — давай поболтаем!',safe=''))],
+        [button('🎯 Задания · ещё награды','task:home')],
         [button('🪙 Мой баланс','ui:balance')],[button('← Главное меню','ui:menu')]]),disable_web_page_preview=True)
 
 
@@ -2912,6 +2942,7 @@ async def show_bot_admin(message, uid, page=0, edit=False):
     if page + 1 < roster['pages']:
         nav.append(button("Далее ➡️", f"admin:users:{page + 1}"))
     maintenance = await eco("maintenance_get")
+    rows.append([button("📋 Заявки заданий","task:inbox"),button("📥 Поддержка","sup:list:0")])
     rows += [[button("🛠 Техработы: " + ("включены" if maintenance else "выключены"), "maintenance:prepare:" + ("0" if maintenance else "1"))], nav, [button("← Главное меню", "ui:menu")]]
     keyboard = InlineKeyboardMarkup(inline_keyboard=rows)
     if not roster['total']:
@@ -3206,7 +3237,8 @@ async def mode_callback(query: CallbackQuery):
         await smart_paywall(query.message)
         return
     await store("mode", query.from_user.id, mode)
-    await show_menu(query.message, query.from_user.id, edit=True)
+    await show_modes(query.message, query.from_user.id)
+    await remove_navigation_screen(query.message,query.from_user.id)
 
 
 @router.callback_query(F.data == "payment:agree")
@@ -3241,6 +3273,15 @@ async def ui_callback(query: CallbackQuery):
         await show_menu(message, uid, edit=True)
     elif action == "menu":
         await return_home(message, uid)
+    elif action == "modes":
+        await show_modes(message,uid)
+    elif action == "settings":
+        await show_settings(message,uid)
+    elif action == "reset_confirm":
+        await message.answer("🧹 Стереть историю диалога? Баланс и покупки сохранятся.",reply_markup=InlineKeyboardMarkup(inline_keyboard=[[button("Да, стереть","ui:reset_apply")],[button("← Настройки","ui:settings")]]))
+    elif action == "reset_apply":
+        await store("reset",uid)
+        await message.answer("🧹 История очищена.",reply_markup=back_keyboard())
     elif action == "pro":
         await show_pro(message, uid)
     elif action == "balance":
@@ -3260,6 +3301,8 @@ async def ui_callback(query: CallbackQuery):
     else:
         # Old v2 buttons do not delete data or start a roast after the upgrade.
         await message.answer("Меню обновилось. Открой /menu.")
+    if action not in ("menu","agree"):
+        await remove_navigation_screen(message,uid)
 
 
 async def errors(event):
@@ -3620,6 +3663,7 @@ async def main():
             BotCommand(command="balance", description="🪙 Общий баланс"),
             BotCommand(command="shop", description="🛍 Магазин токенов и картинок"),
             BotCommand(command="ref", description="🤝 Пригласить друзей"),
+            BotCommand(command="tasks", description="🎯 Задания и награды"),
             BotCommand(command="image", description="🎨 Создать картинку"),
             BotCommand(command="img", description="🎨 Войти в режим картинок"),
             BotCommand(command="soft", description="😌 Без мата"),
@@ -3638,7 +3682,7 @@ async def main():
                 BotCommand(command="terms", description="📜 Условия"),
                 BotCommand(command="paysupport", description="🛟 Помощь с покупкой"),
             ])
-        logging.warning("Gosha v48 image input mode; prompt translation; Cloudflare image API; waiting animation; invitation rewards cap 8m; shared tokens, referrals, shop and maintenance; bots=%s payments=%s owner_has_no_quota=True", len(bots), payments_ready())
+        logging.warning("Gosha v49 sections, tasks and reduced token costs; prompt translation; Cloudflare image API; waiting animation; invitation rewards cap 8m; shared tokens, referrals, shop and maintenance; bots=%s payments=%s owner_has_no_quota=True", len(bots), payments_ready())
         if not payments_ready():
             logging.warning("Payment setup checks failed: %s", ", ".join(name for name, ok, _ in payment_checks() if not ok))
         await dp.start_polling(*bots, allowed_updates=["message", "callback_query", "pre_checkout_query", "chat_member", "my_chat_member"])

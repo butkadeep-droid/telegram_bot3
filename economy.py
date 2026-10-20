@@ -7,8 +7,8 @@ from contextlib import closing
 FREE = 2_500_000
 PLUS = 5_000_000
 FRIEND = 20_000_000
-NORMAL_COST = 100_000
-SMART_COST = 220_000
+NORMAL_COST = 25_000
+SMART_COST = 75_000
 REFERRAL_REWARD = 2_000_000
 REFERRAL_CAP = 8_000_000
 CATALOG = {
@@ -247,6 +247,23 @@ def run(path, action, uid=0, value=None, now=None, owner=0):
             enabled=bool(value)
             con.execute("INSERT INTO credit_meta VALUES('maintenance',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",('1' if enabled else '0',))
             return enabled
+        if action == 'task_review':
+            if not owner or uid != owner or not isinstance(value,dict):return None
+            tid,bid=value.get('tid'),value.get('bid')
+            r=con.execute("SELECT * FROM task_submissions WHERE id=? AND bot_id=? AND status='pending'",(tid,bid)).fetchone()
+            if not r:return None
+            if con.execute('SELECT 1 FROM bot_bans WHERE user_id=?',(r['user_id'],)).fetchone():return None
+            if value.get('approve'):
+                count=con.execute("SELECT COUNT(*) FROM task_evidence WHERE submission_id=? AND state='sent'",(tid,)).fetchone()[0]
+                if count!=20:return None
+                if con.execute("SELECT 1 FROM task_submissions WHERE user_id=? AND campaign=? AND status='approved'",(r['user_id'],r['campaign'])).fetchone():return None
+                key='task:'+r['campaign']+':'+str(r['user_id'])
+                if not credit(con,r['user_id'],'task',5_000_000,key,now,owner):return None
+                state='approved'
+            else:state='rejected'
+            con.execute('UPDATE task_submissions SET status=?,updated=? WHERE id=?',(state,now,tid))
+            con.execute('DELETE FROM task_sessions WHERE submission_id=?',(tid,))
+            return r['user_id']
         if action == 'register':
             return person(con,uid,now,value)
         if action == 'status':
